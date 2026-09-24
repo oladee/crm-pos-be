@@ -364,11 +364,15 @@ export class PosService {
     }
   }
 
-  private async staffBelongsToHub(user: UserDoc, hub: HubDoc) {
+  private async getHubForUser(user: UserDoc) {
     const userHub = refId(user.hub);
-    if (userHub && userHub === String(hub._id)) return true;
-    if (hub.hub_manager && String(hub.hub_manager) === String(user._id)) return true;
-    return false;
+    if (userHub) return this.getHub(userHub);
+    const managed = await this.hubModel.findOne({
+      hub_manager: user._id,
+      is_active: { $ne: false },
+    }).lean();
+    if (managed) return managed;
+    throw new UnauthorizedException('Staff is not assigned to a location');
   }
 
   async verifyPin(dto: {
@@ -381,34 +385,29 @@ export class PosService {
     deviceId?: string;
     deviceLabel?: string;
   }) {
-    const hubId = dto.hubId || dto.storeId;
-    if (!hubId) throw new BadRequestException('hubId is required');
     const pin = String(dto.pin ?? '').trim();
     if (!/^\d{4}$/.test(pin)) throw new BadRequestException('PIN must be 4 digits');
 
     const identifier = (dto.userId || dto.username || dto.email || '').toString().toLowerCase();
-    this.assertPinRateLimit(`${hubId}:${identifier}`);
-
-    const hub = await this.getHub(hubId);
-    await this.assertDeviceHub(dto.deviceId, hubId);
+    if (!identifier) throw new BadRequestException('Username is required');
+    this.assertPinRateLimit(identifier);
 
     let user: UserDoc | null = null;
     if (dto.userId && Types.ObjectId.isValid(dto.userId)) {
       user = await this.userModel.findById(dto.userId).populate('role');
-    } else if (dto.email || dto.username) {
-      const ident = (dto.email || dto.username || '').toLowerCase();
+    } else {
       user = await this.userModel
-        .findOne({ $or: [{ username: ident }, { email: ident }] })
+        .findOne({ $or: [{ username: identifier }, { email: identifier }] })
         .populate('role');
     }
     if (!user || user.is_active === false) throw new UnauthorizedException('Invalid PIN');
 
+    const hub = await this.getHubForUser(user);
+    await this.assertDeviceHub(dto.deviceId, String(hub._id));
+
     const role = user.role as RoleDoc | undefined;
     const mapped = this.toStaff(user, role?.name, String(hub._id));
     if (!mapped) throw new UnauthorizedException('Invalid PIN');
-    if (!(await this.staffBelongsToHub(user, hub))) {
-      throw new UnauthorizedException('Staff is not assigned to this location');
-    }
     if (!user.pin_hash) throw new UnauthorizedException('Till PIN is not set for this user');
     const ok = await bcrypt.compare(pin, user.pin_hash);
     if (!ok) throw new UnauthorizedException('Invalid PIN');
@@ -431,7 +430,7 @@ export class PosService {
       } satisfies PosJwtPayload,
       { expiresIn: '12h' },
     );
-    return { staff: mapped, token };
+    return { staff: mapped, token, location: this.mapLocation(hub) };
   }
 
   async catalog(hubId: string, deviceId?: string) {
