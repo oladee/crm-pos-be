@@ -1,10 +1,15 @@
 import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import type { AuthenticationResponseJSON, RegistrationResponseJSON } from '@simplewebauthn/server';
 import { PosJwtGuard, PosUser, type PosJwtPayload } from './pos-auth';
 import { PosService } from './pos.service';
+import { PosPasskeyService } from './pos-passkey.service';
 
 @Controller('pos')
 export class PosController {
-  constructor(private readonly posService: PosService) {}
+  constructor(
+    private readonly posService: PosService,
+    private readonly passkeys: PosPasskeyService,
+  ) {}
 
   @Get('locations')
   listLocations(@Query('deviceId') deviceId?: string) {
@@ -43,6 +48,7 @@ export class PosController {
       pin: string;
       deviceId?: string;
       deviceLabel?: string;
+      assertion?: AuthenticationResponseJSON;
     },
   ) {
     return this.posService.verifyPin(body);
@@ -57,6 +63,33 @@ export class PosController {
     return this.posService.catalog(hubId || storeId || '', deviceId);
   }
 
+  @Get('devices/status')
+  deviceStatus(@Query('deviceId') deviceId?: string) {
+    return this.passkeys.deviceStatus(deviceId);
+  }
+
+  @Post('devices/register/options')
+  registrationOptions(@Body() body: { deviceId?: string; code?: string }) {
+    return this.passkeys.registrationOptions(String(body.deviceId || ''), String(body.code || ''));
+  }
+
+  @Post('devices/enroll')
+  enroll(
+    @Body() body: { deviceId?: string; code?: string; label?: string; response: RegistrationResponseJSON },
+  ) {
+    return this.passkeys.enroll({
+      deviceId: String(body.deviceId || ''),
+      code: String(body.code || ''),
+      label: body.label,
+      response: body.response,
+    });
+  }
+
+  @Post('devices/authenticate/options')
+  authenticationOptions(@Body() body: { deviceId?: string }) {
+    return this.passkeys.authenticationOptions(String(body.deviceId || ''));
+  }
+
   @Post('devices/bind')
   bindDevice(
     @Body() body: { deviceId?: string; hubId?: string; storeId?: string; label?: string },
@@ -68,6 +101,24 @@ export class PosController {
   @Get('devices')
   listDevices(@PosUser() user: PosJwtPayload) {
     return this.posService.listDevices(user);
+  }
+
+  @UseGuards(PosJwtGuard)
+  @Post('sales/quote')
+  quoteSale(@PosUser() user: PosJwtPayload, @Body() body: Record<string, unknown>) {
+    return this.posService.quoteSale(user, body);
+  }
+
+  @UseGuards(PosJwtGuard)
+  @Get('customers')
+  searchCustomers(@PosUser() user: PosJwtPayload, @Query('q') q?: string) {
+    return this.posService.searchCustomers(user, q);
+  }
+
+  @UseGuards(PosJwtGuard)
+  @Post('customers')
+  createCustomer(@PosUser() user: PosJwtPayload, @Body() body: { name?: string; phone?: string }) {
+    return this.posService.createCustomer(user, body);
   }
 
   @UseGuards(PosJwtGuard)

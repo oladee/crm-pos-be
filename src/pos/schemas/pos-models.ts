@@ -64,6 +64,37 @@ export const PosDeviceSchema = new Schema(
     label: String,
     last_seen: Date,
     bound_at: Date,
+    credential_id: String,
+    public_key: String,
+    sign_count: { type: Number, default: 0 },
+    transports: { type: [String], default: undefined },
+    revoked: { type: Boolean, default: false },
+    credential_device_type: String,
+    credential_backed_up: Boolean,
   },
   { collection: 'pos_devices', timestamps: true },
 );
+
+export const PosEnrollmentCodeSchema = new Schema(
+  {
+    code_hash: { type: String, required: true, unique: true },
+    hub: { type: Schema.Types.ObjectId, ref: 'Hub', required: true, index: true },
+    label: String,
+    expires_at: { type: Date, required: true },
+    used_at: Date,
+    created_by: String,
+  },
+  { collection: 'pos_enrollment_codes', timestamps: true },
+);
+
+export const PosWebauthnChallengeSchema = new Schema(
+  {
+    device_id: { type: String, required: true, index: true },
+    kind: { type: String, enum: ['registration', 'authentication'], required: true },
+    challenge: { type: String, required: true },
+    expires_at: { type: Date, required: true },
+  },
+  { collection: 'pos_webauthn_challenges', timestamps: true },
+);
+
+PosWebauthnChallengeSchema.index({ device_id: 1, kind: 1 }, { unique: true });

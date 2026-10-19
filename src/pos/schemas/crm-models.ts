@@ -48,6 +48,8 @@ export const ProductSchema = new Schema(
     unit_of_measure: String,
     current_stock: Number,
     base_selling_price: Number,
+    carton_price: Number,
+    carton_weight: Number,
     avg_unit_cost: Number,
     hub: { type: Schema.Types.ObjectId, ref: 'Hub' },
     is_active: Boolean,
@@ -100,6 +102,19 @@ export const SaleSchema = new Schema(
   { collection: 'sales', timestamps: true },
 );
 
+export const CustomerSchema = new Schema(
+  {
+    customer_type: { type: String, required: true },
+    customer_name: { type: String, required: true },
+    customer_phone: { type: String, required: true },
+    customer_location: { type: Schema.Types.ObjectId, ref: 'Hub', required: true },
+    assigned_agent: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    added_by: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    joined_date: { type: Date, default: Date.now },
+  },
+  { collection: 'customers', timestamps: true },
+);
+
 export const StockLogSchema = new Schema(
   {
     item: { type: Schema.Types.ObjectId, ref: 'Product' },
@@ -113,6 +128,8 @@ export const StockLogSchema = new Schema(
     notes: String,
     agent: { type: Schema.Types.ObjectId, ref: 'User' },
     batch_number: String,
+    carton_price: Number,
+    carton_weight: Number,
     expiry_date: Date,
     supplier: String,
     from_hub: String,

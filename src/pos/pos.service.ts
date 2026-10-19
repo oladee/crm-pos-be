@@ -9,7 +9,9 @@ import { InjectModel } from '@nestjs/mongoose';
 import { JwtService } from '@nestjs/jwt';
 import { Model, Types } from 'mongoose';
 import * as bcrypt from 'bcryptjs';
+import type { AuthenticationResponseJSON } from '@simplewebauthn/server';
 import type { PosJwtPayload } from './pos-auth';
+import { PosPasskeyService } from './pos-passkey.service';
 
 const POS_ROLES = new Set(['cashier', 'hub_manager']);
 const PIN_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
@@ -46,6 +48,8 @@ type ProductDoc = {
   unit_of_measure?: string;
   current_stock?: number;
   base_selling_price?: number;
+  carton_price?: number;
+  carton_weight?: number;
   avg_unit_cost?: number;
   is_active?: boolean;
   hub?: Types.ObjectId;
@@ -82,6 +86,8 @@ type StockLogDoc = {
   batch_number?: string;
   unit_cost?: number;
   unit_price?: number;
+  carton_price?: number;
+  carton_weight?: number;
   expiry_date?: Date;
   date?: Date;
   supplier?: string;
@@ -93,6 +99,10 @@ type DeviceDoc = {
   hub: Types.ObjectId;
   label?: string;
   last_seen?: Date;
+  bound_at?: Date;
+  credential_id?: string;
+  revoked?: boolean;
+  save: () => Promise<unknown>;
 };
 
 type SaleLineIn = {
@@ -110,6 +120,10 @@ type SaleLineIn = {
   unit_cost?: number;
   discount?: number;
   lineTotal?: number;
+  batchNumber?: string;
+  batch_number?: string;
+  saleUnit?: string;
+  sale_unit?: string;
 };
 
 function oid(id: string, label = 'id') {
@@ -136,6 +150,18 @@ function storeTypeFromOwnership(ownership?: string | null) {
   return ownership === 'RF' ? 'Franchise' : 'Owned';
 }
 
+const POS_TAX_RATE_PCT = 7.5;
+const POS_TAX_INCLUSIVE = true;
+const POS_MAX_DISCOUNT_PCT = 50;
+
+function nairaToKobo(naira: number) {
+  return Math.round((Number(naira) || 0) * 100);
+}
+
+function isCartonUnit(unit?: string) {
+  return String(unit || '').trim().toLowerCase().startsWith('carton');
+}
+
 @Injectable()
 export class PosService {
   private pinAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -145,6 +171,7 @@ export class PosService {
     @InjectModel('Role') private readonly roleModel: Model<RoleDoc>,
     @InjectModel('Hub') private readonly hubModel: Model<HubDoc>,
     @InjectModel('Product') private readonly productModel: Model<ProductDoc>,
+    @InjectModel('Customer') private readonly customerModel: Model<any>,
     @InjectModel('Sale') private readonly saleModel: Model<any>,
     @InjectModel('StockLog') private readonly stockLogModel: Model<any>,
     @InjectModel('PosShift') private readonly shiftModel: Model<any>,
@@ -152,6 +179,7 @@ export class PosService {
     @InjectModel('PosStockCount') private readonly countModel: Model<any>,
     @InjectModel('PosDevice') private readonly deviceModel: Model<DeviceDoc>,
     private readonly jwt: JwtService,
+    private readonly passkeys: PosPasskeyService,
   ) {}
 
   private mapPosRole(name?: string): 'cashier' | 'manager' | null {
@@ -182,9 +210,9 @@ export class PosService {
   }
 
   private async assertDeviceHub(deviceId: string | undefined, hubId: string) {
-    if (!deviceId) return null;
-    const device = await this.deviceModel.findOne({ device_id: deviceId }).lean();
-    if (!device) return null;
+    if (!deviceId) throw new ForbiddenException('This till is not registered');
+    const device = await this.deviceModel.findOne({ device_id: deviceId, revoked: { $ne: true } }).lean();
+    if (!device) throw new ForbiddenException('This till is not registered');
     if (String(device.hub) !== hubId) {
       throw new ForbiddenException('This till is bound to another location');
     }
@@ -210,22 +238,19 @@ export class PosService {
       location_type: h.location_type || 'hub',
       ownership_type: h.ownership_type ?? null,
       storeType: storeTypeFromOwnership(h.ownership_type),
+      taxRatePct: POS_TAX_RATE_PCT,
+      taxInclusive: POS_TAX_INCLUSIVE,
+      maxDiscountPct: POS_MAX_DISCOUNT_PCT,
     };
   }
 
   async listLocations(deviceId?: string) {
-    if (deviceId) {
-      const bound = await this.deviceModel.findOne({ device_id: deviceId }).lean();
-      if (bound) {
-        const hub = await this.hubModel.findById(bound.hub).lean();
-        return { data: hub && hub.is_active !== false ? [this.mapLocation(hub)] : [] };
-      }
-    }
-    const hubs = await this.hubModel
-      .find({ is_active: { $ne: false } })
-      .sort({ hub_name: 1 })
-      .lean();
-    return { data: hubs.map((h) => this.mapLocation(h)) };
+    const id = String(deviceId || '').trim();
+    if (!id) return { data: [] };
+    const bound = await this.deviceModel.findOne({ device_id: id, revoked: { $ne: true } }).lean();
+    if (!bound) return { data: [] };
+    const hub = await this.hubModel.findById(bound.hub).lean();
+    return { data: hub && hub.is_active !== false ? [this.mapLocation(hub)] : [] };
   }
 
   async listStaff(hubId?: string, deviceId?: string) {
@@ -384,9 +409,19 @@ export class PosService {
     pin: string;
     deviceId?: string;
     deviceLabel?: string;
+    assertion?: AuthenticationResponseJSON;
   }) {
     const pin = String(dto.pin ?? '').trim();
     if (!/^\d{4}$/.test(pin)) throw new BadRequestException('PIN must be 4 digits');
+
+    const deviceId = String(dto.deviceId || '').trim();
+    if (!deviceId) throw new ForbiddenException('This till is not registered');
+    const registered = await this.deviceModel.findOne({ device_id: deviceId, revoked: { $ne: true } });
+    if (!registered) throw new ForbiddenException('This till is not registered');
+    if (registered.credential_id) {
+      if (!dto.assertion) throw new ForbiddenException('This till must be unlocked with its passkey');
+      await this.passkeys.verifyAssertion(deviceId, dto.assertion);
+    }
 
     const identifier = (dto.userId || dto.username || dto.email || '').toString().toLowerCase();
     if (!identifier) throw new BadRequestException('Username is required');
@@ -403,7 +438,9 @@ export class PosService {
     if (!user || user.is_active === false) throw new UnauthorizedException('Invalid PIN');
 
     const hub = await this.getHubForUser(user);
-    await this.assertDeviceHub(dto.deviceId, String(hub._id));
+    if (String(registered.hub) !== String(hub._id)) {
+      throw new ForbiddenException('This till is bound to another location');
+    }
 
     const role = user.role as RoleDoc | undefined;
     const mapped = this.toStaff(user, role?.name, String(hub._id));
@@ -412,12 +449,10 @@ export class PosService {
     const ok = await bcrypt.compare(pin, user.pin_hash);
     if (!ok) throw new UnauthorizedException('Invalid PIN');
 
-    if (dto.deviceId) {
-      await this.bindDevice({
-        deviceId: dto.deviceId,
-        hubId: String(hub._id),
-        label: dto.deviceLabel,
-      });
+    if (!registered.credential_id) {
+      registered.last_seen = new Date();
+      if (dto.deviceLabel) registered.label = dto.deviceLabel;
+      await registered.save();
     }
 
     const token = this.jwt.sign(
@@ -440,20 +475,25 @@ export class PosService {
       .find({ hub: oid(hubId, 'hubId'), is_active: { $ne: false } })
       .sort({ name: 1 })
       .lean();
-    return {
-      data: products.map((p) => ({
+    const data: Array<Record<string, unknown>> = [];
+    for (const p of products) {
+      const batches = await this.openBatches(p);
+      const prices = batches.map((b) => b.unitPrice).filter((n) => n > 0);
+      data.push({
         id: String(p._id),
         sku: p.sku,
         name: p.name,
         category: p.category || 'Other',
-        price: Math.round((p.base_selling_price || 0) * 100),
-        cost: Math.round((p.avg_unit_cost || 0) * 100),
+        price: prices.length ? Math.min(...prices) : nairaToKobo(p.base_selling_price || 0),
+        cost: nairaToKobo(p.avg_unit_cost || 0),
         unit: p.unit_of_measure || 'Units',
         stock: p.current_stock ?? 0,
         trackStock: true,
         isActive: p.is_active !== false,
-      })),
-    };
+        batches,
+      });
+    }
+    return { data };
   }
 
   async bindDevice(dto: { deviceId?: string; hubId?: string; storeId?: string; label?: string }) {
@@ -461,20 +501,17 @@ export class PosService {
     const hubId = dto.hubId || dto.storeId;
     if (!deviceId) throw new BadRequestException('deviceId is required');
     if (!hubId) throw new BadRequestException('hubId is required');
+    const existing = await this.deviceModel.findOne({ device_id: deviceId, revoked: { $ne: true } });
+    if (!existing) throw new ForbiddenException('This till is not registered');
     const hub = await this.getHub(hubId);
-    const existing = await this.deviceModel.findOne({ device_id: deviceId });
-    if (existing && String(existing.hub) !== String(hub._id)) {
+    if (String(existing.hub) !== String(hub._id)) {
       throw new ForbiddenException('This till is already bound to another location');
     }
     const now = new Date();
-    const doc = await this.deviceModel.findOneAndUpdate(
-      { device_id: deviceId },
-      {
-        $set: { hub: hub._id, label: dto.label, last_seen: now },
-        $setOnInsert: { bound_at: now },
-      },
-      { upsert: true, new: true },
-    );
+    existing.last_seen = now;
+    if (dto.label) existing.label = dto.label;
+    await existing.save();
+    const doc = existing;
     return {
       data: {
         deviceId: doc.device_id,
@@ -499,7 +536,7 @@ export class PosService {
 
   private async requireBoundDevice(deviceId: string | undefined, hubId: string) {
     if (!deviceId) throw new BadRequestException('deviceId is required');
-    const device = await this.deviceModel.findOne({ device_id: deviceId });
+    const device = await this.deviceModel.findOne({ device_id: deviceId, revoked: { $ne: true } });
     if (!device) throw new ForbiddenException('Till is not bound to a location');
     if (String(device.hub) !== hubId) {
       throw new ForbiddenException('This till is bound to another location');
@@ -521,6 +558,8 @@ export class PosService {
       quantityRemaining: number;
       unitCost: number;
       unitPrice: number;
+      cartonPrice: number;
+      cartonWeight: number;
     };
     const batches: Batch[] = [];
     let anon = 0;
@@ -548,6 +587,8 @@ export class PosService {
             quantityRemaining: qty,
             unitCost: Number(log.unit_cost) || 0,
             unitPrice: Number(log.unit_price) || 0,
+            cartonPrice: Number(log.carton_price) || 0,
+            cartonWeight: Number(log.carton_weight) || 0,
           });
         }
       } else if (outbound) {
@@ -575,6 +616,144 @@ export class PosService {
       if (b.expiryDate) return 1;
       return a.date.getTime() - b.date.getTime();
     });
+  }
+
+  private async openBatches(product: ProductDoc) {
+    const rows = await this.computeRemainingBatches(product._id);
+    const grouped = new Map<string, {
+      batchNumber: string;
+      quantityRemaining: number;
+      unitPrice: number;
+      cartonPrice: number;
+      cartonWeight: number;
+      unitCost: number;
+      date: Date;
+    }>();
+    for (const row of rows) {
+      if (row.batchNumber.startsWith('UNLABELED-')) continue;
+      const current = grouped.get(row.batchNumber);
+      if (!current) {
+        grouped.set(row.batchNumber, { ...row });
+        continue;
+      }
+      current.quantityRemaining += row.quantityRemaining;
+      if (row.date.getTime() >= current.date.getTime()) {
+        current.date = row.date;
+        current.unitPrice = row.unitPrice || current.unitPrice;
+        current.unitCost = row.unitCost || current.unitCost;
+        current.cartonPrice = row.cartonPrice || current.cartonPrice;
+        current.cartonWeight = row.cartonWeight || current.cartonWeight;
+      }
+    }
+    return [...grouped.values()].map((batch) => ({
+      batchNumber: batch.batchNumber,
+      quantityRemaining: batch.quantityRemaining,
+      unitPrice: nairaToKobo(batch.unitPrice || product.base_selling_price || 0),
+      cartonPrice: nairaToKobo(batch.cartonPrice || product.carton_price || 0),
+      cartonWeight: batch.cartonWeight || Number(product.carton_weight) || 0,
+      unitCost: nairaToKobo(batch.unitCost || product.avg_unit_cost || 0),
+    }));
+  }
+
+  private async priceCart(hubId: string, payload: Record<string, any>, checkTotal: boolean) {
+    const lines: SaleLineIn[] = payload.items || payload.lines || [];
+    if (!lines.length) throw new BadRequestException('Sale has no items');
+    const priced: Array<{
+      product: ProductDoc;
+      batchNumber: string;
+      saleUnit: string;
+      quantity: number;
+      stockQuantity: number;
+      unitPriceKobo: number;
+      unitCostKobo: number;
+      discountKobo: number;
+      name: string;
+    }> = [];
+    let subtotal = 0;
+    let lineDiscount = 0;
+    for (const line of lines) {
+      const productId = String(line.productId || line.product || '');
+      if (!Types.ObjectId.isValid(productId)) throw new BadRequestException('Each line needs a product');
+      const product = await this.productModel.findById(productId);
+      if (!product || String(product.hub) !== hubId) {
+        throw new ForbiddenException('A product on this sale is not stocked at this location');
+      }
+      const batchNumber = normalizeBatchNumber(line.batchNumber || line.batch_number);
+      if (!batchNumber) throw new BadRequestException(`Select a batch for ${product.name}`);
+      const batches = await this.openBatches(product);
+      const batch = batches.find((b) => b.batchNumber === batchNumber);
+      if (!batch) throw new BadRequestException(`Batch ${batchNumber} is not open for ${product.name}`);
+      const carton = isCartonUnit(product.unit_of_measure);
+      const saleUnit = carton
+        ? (line.saleUnit || line.sale_unit || '')
+        : (line.saleUnit || line.sale_unit || product.unit_of_measure || 'Units');
+      if (carton && saleUnit !== 'Carton' && saleUnit !== 'Kg') {
+        throw new BadRequestException(`Select Carton or Kg for ${product.name}`);
+      }
+      const unitPriceKobo = saleUnit === 'Carton' ? batch.cartonPrice : batch.unitPrice;
+      if (!unitPriceKobo) {
+        throw new BadRequestException(`Batch ${batchNumber} has no selling price for ${product.name}`);
+      }
+      const qty = this.lineQty(line);
+      if (qty <= 0) throw new BadRequestException(`Quantity is required for ${product.name}`);
+      let stockQuantity = qty;
+      if (saleUnit === 'Carton') {
+        if (!(batch.cartonWeight > 0)) {
+          throw new BadRequestException(`Set the carton weight on batch ${batchNumber} before selling it`);
+        }
+        stockQuantity = qty * batch.cartonWeight;
+      }
+      if (batch.quantityRemaining < stockQuantity) {
+        throw new BadRequestException(
+          `Batch ${batchNumber} has ${batch.quantityRemaining} left for ${product.name}`,
+        );
+      }
+      const gross = unitPriceKobo * qty;
+      const discountKobo = Math.max(0, Math.round(Number(line.discount) || 0));
+      const cap = Math.round(gross * (POS_MAX_DISCOUNT_PCT / 100));
+      if (discountKobo > cap) {
+        throw new BadRequestException(`Discount on ${product.name} is above ${POS_MAX_DISCOUNT_PCT}%`);
+      }
+      subtotal += gross;
+      lineDiscount += discountKobo;
+      priced.push({
+        product,
+        batchNumber,
+        saleUnit,
+        quantity: qty,
+        stockQuantity,
+        unitPriceKobo,
+        unitCostKobo: batch.unitCost,
+        discountKobo,
+        name: product.name,
+      });
+    }
+    const afterLines = subtotal - lineDiscount;
+    const orderDiscount = Math.max(0, Math.round(Number(payload.orderDiscount) || 0));
+    const orderCap = Math.round(afterLines * (POS_MAX_DISCOUNT_PCT / 100));
+    if (orderDiscount > orderCap) {
+      throw new BadRequestException(`Cart discount is above ${POS_MAX_DISCOUNT_PCT}%`);
+    }
+    const net = afterLines - orderDiscount;
+    const rate = POS_TAX_RATE_PCT / 100;
+    const tax = rate > 0 && POS_TAX_INCLUSIVE ? Math.round(net - net / (1 + rate)) : Math.round(net * rate);
+    const total = POS_TAX_INCLUSIVE || rate <= 0 ? net : net + tax;
+    if (checkTotal && payload.total != null) {
+      const claimed = Math.round(Number(payload.total) || 0);
+      if (Math.abs(claimed - total) > 1) {
+        throw new BadRequestException('The sale total does not match the batch price');
+      }
+    }
+    return {
+      subtotal,
+      discount: lineDiscount + orderDiscount,
+      orderDiscount,
+      tax,
+      taxRatePct: POS_TAX_RATE_PCT,
+      taxInclusive: POS_TAX_INCLUSIVE,
+      total,
+      lines: priced,
+    };
   }
 
   private async writeStockLog(input: {
@@ -610,39 +789,27 @@ export class PosService {
     unitPrice: number,
     saleId: string,
     agentId: string,
+    batchNumber?: string,
+    unitCost?: number,
   ) {
-    const batches = await this.computeRemainingBatches(product._id);
-    let remaining = qty;
-    if (batches.length > 0) {
-      for (const batch of batches) {
-        if (remaining <= 0) break;
-        const take = Math.min(batch.quantityRemaining, remaining);
-        await this.writeStockLog({
-          product,
-          type: 'SALE',
-          quantity: -take,
-          unitCost: batch.unitCost,
-          unitPrice,
-          referenceId: saleId,
-          agentId,
-          batchNumber: batch.batchNumber,
-          notes: 'POS sale',
-        });
-        remaining -= take;
-      }
+    const batch = normalizeBatchNumber(batchNumber);
+    if (!batch) throw new BadRequestException(`Select a batch for ${product.name}`);
+    const open = await this.openBatches(product);
+    const match = open.find((row) => row.batchNumber === batch);
+    if (!match || match.quantityRemaining < qty) {
+      throw new BadRequestException(`Batch ${batch} does not have enough left for ${product.name}`);
     }
-    if (remaining > 0) {
-      await this.writeStockLog({
-        product,
-        type: 'SALE',
-        quantity: -remaining,
-        unitCost: product.avg_unit_cost || 0,
-        unitPrice,
-        referenceId: saleId,
-        agentId,
-        notes: 'POS sale',
-      });
-    }
+    await this.writeStockLog({
+      product,
+      type: 'SALE',
+      quantity: -qty,
+      unitCost: unitCost ?? koboToNaira(match.unitCost),
+      unitPrice,
+      referenceId: saleId,
+      agentId,
+      batchNumber: batch,
+      notes: 'POS sale',
+    });
     const next = Math.max(0, (Number(product.current_stock) || 0) - qty);
     await this.productModel.updateOne(
       { _id: product._id },
@@ -701,6 +868,75 @@ export class PosService {
     return koboToNaira(Number(line.unitCost || 0));
   }
 
+  async quoteSale(user: PosJwtPayload, payload: Record<string, any>) {
+    const hubId = this.assertJwtHub(user, payload.hubId || payload.storeId || user.hubId);
+    await this.requireBoundDevice(payload.deviceId || user.deviceId, hubId);
+    const priced = await this.priceCart(hubId, payload, false);
+    return {
+      subtotal: priced.subtotal,
+      discount: priced.discount,
+      orderDiscount: priced.orderDiscount,
+      tax: priced.tax,
+      taxRatePct: priced.taxRatePct,
+      taxInclusive: priced.taxInclusive,
+      total: priced.total,
+      lines: priced.lines.map((line) => ({
+        productId: String(line.product._id),
+        batchNumber: line.batchNumber,
+        saleUnit: line.saleUnit,
+        qty: line.quantity,
+        unitPrice: line.unitPriceKobo,
+        discount: line.discountKobo,
+      })),
+    };
+  }
+
+  async searchCustomers(user: PosJwtPayload, query?: string) {
+    const hubId = this.assertJwtHub(user, user.hubId);
+    const q = String(query || '').trim();
+    const filter: Record<string, unknown> = { customer_location: oid(hubId, 'hubId') };
+    if (q) {
+      const safe = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      filter.$or = [
+        { customer_name: { $regex: safe, $options: 'i' } },
+        { customer_phone: { $regex: safe, $options: 'i' } },
+      ];
+    }
+    const rows = await this.customerModel.find(filter).sort({ customer_name: 1 }).limit(10).lean();
+    return {
+      data: rows.map((row) => ({
+        id: String(row._id),
+        name: row.customer_name,
+        phone: row.customer_phone,
+      })),
+    };
+  }
+
+  async createCustomer(user: PosJwtPayload, input: { name?: string; phone?: string }) {
+    const hubId = this.assertJwtHub(user, user.hubId);
+    const name = String(input.name || '').trim();
+    const phone = String(input.phone || '').trim();
+    if (!name) throw new BadRequestException('Customer name is required');
+    if (!/^\+?\d{7,15}$/.test(phone)) throw new BadRequestException('Enter a phone number for this customer');
+    const existing = await this.customerModel.findOne({ customer_phone: phone });
+    if (existing) {
+      if (String(existing.customer_location) !== hubId) {
+        throw new BadRequestException('This phone already belongs to a customer at another location');
+      }
+      return { data: { id: String(existing._id), name: existing.customer_name, phone: existing.customer_phone } };
+    }
+    const created = await this.customerModel.create({
+      customer_type: 'b2c',
+      customer_name: name,
+      customer_phone: phone,
+      customer_location: oid(hubId, 'hubId'),
+      assigned_agent: oid(user.sub, 'cashier'),
+      added_by: oid(user.sub, 'cashier'),
+      joined_date: new Date(),
+    });
+    return { data: { id: String(created._id), name: created.customer_name, phone: created.customer_phone } };
+  }
+
   async createSale(user: PosJwtPayload, payload: Record<string, any>) {
     const clientSaleId = String(payload.clientSaleId || payload.id || '').trim();
     if (!clientSaleId) throw new BadRequestException('clientSaleId is required');
@@ -710,53 +946,36 @@ export class PosService {
     const existing = await this.saleModel.findOne({ client_sale_id: clientSaleId }).lean();
     if (existing) return { data: existing, idempotent: true };
 
-    const lines: SaleLineIn[] = payload.items || payload.lines || [];
-    if (!lines.length) throw new BadRequestException('Sale has no items');
-
-    const mappedItems: Array<{
-      product?: Types.ObjectId;
-      product_name: string;
-      quantity: number;
-      unit?: string;
-      stock_quantity: number;
-      category?: string;
-      unit_cost: number;
-      unit_price: number;
-    }> = [];
+    const priced = await this.priceCart(hubId, payload, true);
+    const mappedItems = priced.lines.map((line) => ({
+      product: line.product._id,
+      product_name: line.name,
+      quantity: line.quantity,
+      unit: line.saleUnit,
+      sale_unit: line.saleUnit,
+      stock_quantity: line.stockQuantity,
+      category: line.product.category,
+      batch_number: line.batchNumber,
+      unit_cost: koboToNaira(line.unitCostKobo),
+      unit_price: koboToNaira(line.unitPriceKobo),
+    }));
     let profit = 0;
-    for (const line of lines) {
-      const productId = line.productId || line.product;
-      const qty = this.lineQty(line);
-      const unitPrice = this.lineUnitPriceNaira(line);
-      const unitCost = this.lineUnitCostNaira(line);
-      const product =
-        productId && Types.ObjectId.isValid(productId)
-          ? await this.productModel.findById(productId)
-          : null;
-      if (product && String(product.hub) !== hubId) {
-        throw new ForbiddenException(`${product.name} is not stocked at this location`);
-      }
-      profit += (unitPrice - unitCost) * qty;
-      mappedItems.push({
-        product: product?._id,
-        product_name: line.name || line.product_name || product?.name || 'Item',
-        quantity: qty,
-        unit: line.unit || product?.unit_of_measure,
-        stock_quantity: qty,
-        category: product?.category,
-        unit_cost: unitCost,
-        unit_price: unitPrice,
-      });
+    for (const line of priced.lines) {
+      const revenue = koboToNaira(line.unitPriceKobo) * line.quantity - koboToNaira(line.discountKobo);
+      const cost = koboToNaira(line.unitCostKobo) * line.stockQuantity;
+      profit += revenue - cost;
     }
 
-    const total = payload.total != null ? koboToNaira(payload.total) : Number(payload.amount) || 0;
     const firstPay = (payload.payments || [])[0];
     const agentName = payload.cashierName || payload.agent_name || 'Cashier';
-    const amount = Math.round(total * 100) / 100;
+    const amount = Math.round(priced.total) / 100;
     const profitAmount = Math.round(profit * 100) / 100;
+    const customerId = payload.customerId && Types.ObjectId.isValid(String(payload.customerId))
+      ? oid(String(payload.customerId), 'customerId')
+      : null;
 
     const created = await this.saleModel.create({
-      customer: null,
+      customer: customerId,
       customer_name: payload.customerName || 'Walk-in',
       amount,
       profit_margin: amount ? Math.round((profitAmount / amount) * 10000) / 100 : 0,
@@ -778,16 +997,18 @@ export class PosService {
       client_sale_id: clientSaleId,
     });
 
-    for (const line of mappedItems) {
-      if (!line.product) continue;
-      const product = await this.productModel.findById(line.product);
-      if (!product) continue;
+    for (const line of priced.lines) {
+      const perStockKobo = line.saleUnit === 'Carton' && line.stockQuantity > 0
+        ? Math.round((line.unitPriceKobo * line.quantity) / line.stockQuantity)
+        : line.unitPriceKobo;
       await this.deductProductStock(
-        product,
-        line.quantity,
-        line.unit_price,
+        line.product,
+        line.stockQuantity,
+        koboToNaira(perStockKobo),
         clientSaleId,
         user.sub,
+        line.batchNumber,
+        koboToNaira(line.unitCostKobo),
       );
     }
 
