@@ -1,0 +1,12 @@
+---
+description: Use pnpm as the only package manager for the POS API
+alwaysApply: true
+---
+
+# pnpm only
+
+Install, add, and update dependencies with pnpm. Do not run npm or yarn.
+
+`pnpm-lock.yaml` is the lockfile. After any `package.json` change, run `pnpm install` and commit `pnpm-lock.yaml` with it. Do not create or update `package-lock.json`.
+
+The deploy installs with `pnpm install --frozen-lockfile`. A package added only to `package.json` or `package-lock.json` fails that install.
