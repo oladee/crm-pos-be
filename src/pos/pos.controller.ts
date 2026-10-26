@@ -1,14 +1,18 @@
-import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
+import type { RawBodyRequest } from '@nestjs/common';
+import type { Request } from 'express';
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from '@simplewebauthn/server';
 import { PosJwtGuard, PosUser, type PosJwtPayload } from './pos-auth';
 import { PosService } from './pos.service';
 import { PosPasskeyService } from './pos-passkey.service';
+import { PosTransferService } from './pos-transfer.service';
 
 @Controller('pos')
 export class PosController {
   constructor(
     private readonly posService: PosService,
     private readonly passkeys: PosPasskeyService,
+    private readonly transfers: PosTransferService,
   ) {}
 
   @Get('locations')
@@ -119,6 +123,39 @@ export class PosController {
   @Post('customers')
   createCustomer(@PosUser() user: PosJwtPayload, @Body() body: { name?: string; phone?: string }) {
     return this.posService.createCustomer(user, body);
+  }
+
+  @Post('webhooks/bachs')
+  bachsWebhook(@Req() req: RawBodyRequest<Request>) {
+    return this.transfers.handleWebhook(req.rawBody?.toString('utf8') || '', req.headers);
+  }
+
+  @UseGuards(PosJwtGuard)
+  @Post('payments/transfers')
+  startTransfer(@PosUser() user: PosJwtPayload, @Body() body: Record<string, unknown>) {
+    return this.transfers.start(user, body);
+  }
+
+  @UseGuards(PosJwtGuard)
+  @Get('payments/transfers')
+  listTransfers(@PosUser() user: PosJwtPayload, @Query('deviceId') deviceId?: string) {
+    return this.transfers.list(user, deviceId);
+  }
+
+  @UseGuards(PosJwtGuard)
+  @Get('payments/transfers/:clientSaleId')
+  transferStatus(
+    @PosUser() user: PosJwtPayload,
+    @Param('clientSaleId') clientSaleId: string,
+    @Query('refresh') refresh?: string,
+  ) {
+    return this.transfers.status(user, clientSaleId, refresh === '1');
+  }
+
+  @UseGuards(PosJwtGuard)
+  @Post('payments/transfers/:clientSaleId/cancel')
+  cancelTransfer(@PosUser() user: PosJwtPayload, @Param('clientSaleId') clientSaleId: string) {
+    return this.transfers.cancel(user, clientSaleId);
   }
 
   @UseGuards(PosJwtGuard)

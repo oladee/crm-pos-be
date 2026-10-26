@@ -5,6 +5,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { PosController } from './pos.controller';
 import { PosService } from './pos.service';
 import { PosPasskeyService } from './pos-passkey.service';
+import { PosTransferService } from './pos-transfer.service';
 import { PosJwtGuard } from './pos-auth';
 import {
   CustomerSchema,
@@ -22,6 +23,7 @@ import {
   PosShiftSchema,
   PosStockCountSchema,
   PosWebauthnChallengeSchema,
+  PosTransferSchema,
 } from './schemas/pos-models';
 
 @Module({
@@ -40,6 +42,7 @@ import {
       { name: 'PosDevice', schema: PosDeviceSchema },
       { name: 'PosEnrollmentCode', schema: PosEnrollmentCodeSchema },
       { name: 'PosWebauthnChallenge', schema: PosWebauthnChallengeSchema },
+      { name: 'PosTransfer', schema: PosTransferSchema },
     ]),
     JwtModule.registerAsync({
       imports: [ConfigModule],
@@ -50,6 +53,6 @@ import {
     }),
   ],
   controllers: [PosController],
-  providers: [PosService, PosPasskeyService, PosJwtGuard],
+  providers: [PosService, PosPasskeyService, PosTransferService, PosJwtGuard],
 })
 export class PosModule {}

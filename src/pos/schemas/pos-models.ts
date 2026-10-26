@@ -98,3 +98,26 @@ export const PosWebauthnChallengeSchema = new Schema(
 );
 
 PosWebauthnChallengeSchema.index({ device_id: 1, kind: 1 }, { unique: true });
+
+export const PosTransferSchema = new Schema(
+  {
+    client_sale_id: { type: String, required: true, unique: true },
+    checkout_id: { type: String, index: true },
+    hub: { type: Schema.Types.ObjectId, ref: 'Hub', required: true, index: true },
+    device_id: { type: String, index: true },
+    cashier: { type: Schema.Types.ObjectId, ref: 'User' },
+    cashier_name: String,
+    status: { type: String, enum: ['awaiting', 'paid', 'cancelled', 'expired'], default: 'awaiting', index: true },
+    cart_total_kobo: { type: Number, required: true },
+    payable_kobo: { type: Number, required: true },
+    currency: { type: String, default: 'NGN' },
+    bank_name: String,
+    account_name: String,
+    account_number: String,
+    expires_at: Date,
+    sale_payload: Schema.Types.Mixed,
+    event_ids: { type: [String], default: [] },
+    paid_at: Date,
+  },
+  { collection: 'pos_transfers', timestamps: true },
+);
