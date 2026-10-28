@@ -870,7 +870,10 @@ export class PosService {
 
   async quoteSale(user: PosJwtPayload, payload: Record<string, any>) {
     const hubId = this.assertJwtHub(user, payload.hubId || payload.storeId || user.hubId);
-    await this.requireBoundDevice(payload.deviceId || user.deviceId, hubId);
+    if (!user.deviceId || (payload.deviceId && payload.deviceId !== user.deviceId)) {
+      throw new ForbiddenException('Session is scoped to another till');
+    }
+    await this.requireBoundDevice(user.deviceId, hubId);
     const priced = await this.priceCart(hubId, payload, false);
     return {
       subtotal: priced.subtotal,
@@ -941,10 +944,18 @@ export class PosService {
     const clientSaleId = String(payload.clientSaleId || payload.id || '').trim();
     if (!clientSaleId) throw new BadRequestException('clientSaleId is required');
     const hubId = this.assertJwtHub(user, payload.hubId || payload.storeId || user.hubId);
-    await this.requireBoundDevice(payload.deviceId || user.deviceId, hubId);
+    if (!user.deviceId || (payload.deviceId && payload.deviceId !== user.deviceId)) {
+      throw new ForbiddenException('Session is scoped to another till');
+    }
+    await this.requireBoundDevice(user.deviceId, hubId);
 
     const existing = await this.saleModel.findOne({ client_sale_id: clientSaleId }).lean();
-    if (existing) return { data: existing, idempotent: true };
+    if (existing) {
+      if (String(existing.hub) !== hubId || (existing.device_id && existing.device_id !== user.deviceId)) {
+        throw new ForbiddenException('Transaction belongs to another location or till');
+      }
+      return { data: existing, idempotent: true };
+    }
 
     const priced = await this.priceCart(hubId, payload, true);
     const mappedItems = priced.lines.map((line) => ({
@@ -993,6 +1004,7 @@ export class PosService {
       payment_type: this.paymentType(firstPay?.method),
       payment_mode: this.paymentMode(firstPay?.method),
       amount_paid: this.paymentMode(firstPay?.method) === 'Full Credit' ? 0 : amount,
+      device_id: user.deviceId,
       source: 'pos',
       client_sale_id: clientSaleId,
     });
@@ -1022,12 +1034,20 @@ export class PosService {
     kind: 'refund' | 'void',
   ) {
     const hubId = this.assertJwtHub(user, payload.hubId || user.hubId);
-    await this.requireBoundDevice(payload.deviceId || user.deviceId, hubId);
+    if (!user.deviceId || (payload.deviceId && payload.deviceId !== user.deviceId)) {
+      throw new ForbiddenException('Session is scoped to another till');
+    }
+    await this.requireBoundDevice(user.deviceId, hubId);
     const reversalId = String(payload.reversalId || payload.id || '').trim();
     if (!reversalId) throw new BadRequestException('reversalId is required');
 
     const existing = await this.saleModel.findOne({ client_sale_id: reversalId }).lean();
-    if (existing) return { data: existing, idempotent: true };
+    if (existing) {
+      if (String(existing.hub) !== hubId || (existing.device_id && existing.device_id !== user.deviceId)) {
+        throw new ForbiddenException('Transaction belongs to another location or till');
+      }
+      return { data: existing, idempotent: true };
+    }
 
     const original = await this.saleModel.findOne({ client_sale_id: originalClientId });
     if (!original) throw new NotFoundException('Original sale not found');
@@ -1081,6 +1101,7 @@ export class PosService {
       payment_type: this.paymentType(firstPay?.method),
       payment_mode: 'Full Payment',
       amount_paid: amount,
+      device_id: user.deviceId,
       source: 'pos',
       client_sale_id: reversalId,
       reversal_of: originalClientId,
@@ -1114,7 +1135,10 @@ export class PosService {
 
   async upsertShift(user: PosJwtPayload, payload: Record<string, any>) {
     const hubId = this.assertJwtHub(user, payload.hubId || user.hubId);
-    await this.requireBoundDevice(payload.deviceId || user.deviceId, hubId);
+    if (!user.deviceId || (payload.deviceId && payload.deviceId !== user.deviceId)) {
+      throw new ForbiddenException('Session is scoped to another till');
+    }
+    await this.requireBoundDevice(user.deviceId, hubId);
     const clientId = String(payload.id || payload.clientShiftId || '').trim();
     if (!clientId) throw new BadRequestException('shift id is required');
     const doc = await this.shiftModel.findOneAndUpdate(
@@ -1150,7 +1174,10 @@ export class PosService {
 
   async upsertAssist(user: PosJwtPayload, payload: Record<string, any>) {
     const hubId = this.assertJwtHub(user, payload.hubId || user.hubId);
-    await this.requireBoundDevice(payload.deviceId || user.deviceId, hubId);
+    if (!user.deviceId || (payload.deviceId && payload.deviceId !== user.deviceId)) {
+      throw new ForbiddenException('Session is scoped to another till');
+    }
+    await this.requireBoundDevice(user.deviceId, hubId);
     const clientId = String(payload.id || payload.clientAssistId || '').trim();
     if (!clientId) throw new BadRequestException('assist id is required');
     const doc = await this.assistModel.findOneAndUpdate(
@@ -1194,7 +1221,10 @@ export class PosService {
 
   async upsertStockCount(user: PosJwtPayload, payload: Record<string, any>) {
     const hubId = this.assertJwtHub(user, payload.hubId || user.hubId);
-    await this.requireBoundDevice(payload.deviceId || user.deviceId, hubId);
+    if (!user.deviceId || (payload.deviceId && payload.deviceId !== user.deviceId)) {
+      throw new ForbiddenException('Session is scoped to another till');
+    }
+    await this.requireBoundDevice(user.deviceId, hubId);
     const day = String(payload.day || payload.id || '').trim();
     if (!day) throw new BadRequestException('day is required');
     const counts: Record<string, number> = payload.counts || {};

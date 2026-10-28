@@ -96,6 +96,7 @@ export const SaleSchema = new Schema(
     amount_paid: { type: Number, default: 0 },
     source: { type: String, default: 'pos' },
     client_sale_id: { type: String, sparse: true, unique: true },
+    device_id: { type: String, index: true },
     reversal_of: String,
     reversal_kind: String,
   },
