@@ -125,6 +125,19 @@ export class PosController {
     return this.posService.createCustomer(user, body);
   }
 
+  @Post('webhooks/squad')
+  squadWebhook(@Req() req: RawBodyRequest<Request>) {
+    return this.transfers.handleWebhook(req.rawBody?.toString('utf8') || '', req.headers, 'squad');
+  }
+
+  @UseGuards(PosJwtGuard)
+  @Get('payments/options')
+  paymentOptions(@PosUser() user: PosJwtPayload) { return this.transfers.options(user); }
+
+  @UseGuards(PosJwtGuard)
+  @Post('payments/transfers/:clientSaleId/confirm-received')
+  confirmReceived(@PosUser() user: PosJwtPayload, @Param('clientSaleId') id: string) { return this.transfers.confirmReceived(user, id); }
+
   @Post('webhooks/bachs')
   bachsWebhook(@Req() req: RawBodyRequest<Request>) {
     return this.transfers.handleWebhook(req.rawBody?.toString('utf8') || '', req.headers);

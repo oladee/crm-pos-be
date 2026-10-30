@@ -1,3 +1,5 @@
+import mongoose from 'mongoose';
+mongoose.set('transactionAsyncLocalStorage', true);
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';

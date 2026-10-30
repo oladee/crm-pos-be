@@ -1,4 +1,5 @@
 import { BadRequestException, ServiceUnavailableException } from '@nestjs/common';
+import { ProviderFailure } from './payment-provider';
 
 export type BachsInstructions = {
   checkoutId: string;
@@ -95,14 +96,15 @@ export class BachsClient {
         method,
         headers,
         body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(20_000),
       });
     } catch {
-      throw new ServiceUnavailableException('Bachs could not be reached');
+      throw new ProviderFailure('Bachs response is unknown. Check this payment before trying again.', false);
     }
     const json = (await res.json().catch(() => ({}))) as Json;
     if (!res.ok) {
       const message = String(json.message || json.error || `Bachs returned ${res.status}`);
-      throw new BadRequestException(message);
+      throw new ProviderFailure(message, [400, 401, 403, 404, 422].includes(res.status));
     }
     return json;
   }

@@ -20,6 +20,9 @@ describe('authenticated till attribution', () => {
     // Exercise the real sale/reversal methods, with storage and pricing kept in memory.
     service = Object.create(PosService.prototype);
     state = service as any;
+    state.inventoryTransaction = jest.fn(work => work());
+    state.lockPaymentProducts = jest.fn().mockResolvedValue(undefined);
+    state.productModel = { db: { model: () => ({ exists: async () => null }) } };
     state.deviceModel = {
       findOne: jest.fn().mockResolvedValue({ hub, save: jest.fn() }),
     };

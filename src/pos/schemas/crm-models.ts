@@ -1,3 +1,4 @@
+import { productInventoryGuard, stockLogInventoryGuard } from '../inventory-guard';
 import { Schema } from 'mongoose';
 
 export const UserSchema = new Schema(
@@ -27,6 +28,7 @@ export const RoleSchema = new Schema(
 export const HubSchema = new Schema(
   {
     hub_name: String,
+    pos_manual_payment_confirmation: { type: Boolean, default: false },
     hub_address: String,
     hub_phone: String,
     hub_manager: { type: Schema.Types.ObjectId, ref: 'User' },
@@ -105,6 +107,8 @@ export const SaleSchema = new Schema(
 
 export const CustomerSchema = new Schema(
   {
+    email: String,
+    customer_email: String,
     customer_type: { type: String, required: true },
     customer_name: { type: String, required: true },
     customer_phone: { type: String, required: true },
@@ -140,3 +144,6 @@ export const StockLogSchema = new Schema(
   },
   { collection: 'stocklogs', timestamps: true },
 );
+
+ProductSchema.plugin(productInventoryGuard);
+StockLogSchema.plugin(stockLogInventoryGuard);

@@ -1,216 +1,239 @@
-import {
-  BadRequestException,
-  ForbiddenException,
-  Injectable,
-  NotFoundException,
-  ServiceUnavailableException,
-} from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
-import { BachsClient, isPaidStatus, nairaToKobo, readTransferInstructions } from './bachs.client';
-import { verifyBachsSignature } from './bachs-signature';
 import { PosJwtPayload } from './pos-auth';
 import { PosService } from './pos.service';
+import { BachsProvider } from './bachs-provider';
+import { SquadClient } from './squad.client';
+import { PaymentEvidence, PaymentProvider, PaymentProviderId, ProviderFailure } from './payment-provider';
 
-type TransferDoc = {
-  client_sale_id: string;
-  checkout_id?: string;
-  hub: Types.ObjectId;
-  device_id?: string;
-  cashier?: Types.ObjectId;
-  cashier_name?: string;
-  status: 'awaiting' | 'paid' | 'cancelled' | 'expired';
-  cart_total_kobo: number;
-  payable_kobo: number;
-  currency: string;
-  bank_name?: string;
-  account_name?: string;
-  account_number?: string;
-  expires_at?: Date;
-  sale_payload: Record<string, unknown>;
-  event_ids: string[];
-  paid_at?: Date;
-};
+const UNRESOLVED = ['initializing', 'awaiting', 'expired', 'review'];
 
 @Injectable()
 export class PosTransferService {
   constructor(
-    @InjectModel('PosTransfer') private readonly transfers: Model<TransferDoc>,
+    @InjectModel('PosTransfer') private readonly transfers: Model<any>,
     private readonly pos: PosService,
+    @InjectModel('Hub') private readonly hubs: Model<any>,
+    @InjectModel('User') private readonly users: Model<any>,
+    @InjectModel('Customer') private readonly customers: Model<any>,
   ) {}
 
-  private client() {
-    const apiKey = process.env.BACHS_API_KEY || '';
-    if (!apiKey) throw new ServiceUnavailableException('Bank transfer is not configured');
-    return new BachsClient(apiKey);
+  private provider(id: PaymentProviderId): PaymentProvider {
+    if (id === 'squad' && process.env.SQUAD_DVA_APPROVED === 'true' && process.env.SQUAD_CONTRACT_VERIFIED === 'true' && process.env.SQUAD_SECRET_KEY) return new SquadClient(process.env.SQUAD_SECRET_KEY);
+    if (id === 'bachs' && process.env.BACHS_API_KEY) return new BachsProvider(process.env.BACHS_API_KEY, process.env.BACHS_WEBHOOK_SECRET || '');
+    throw new ServiceUnavailableException('This payment provider is not available');
   }
 
-  private view(row: TransferDoc) {
-    return {
-      clientSaleId: row.client_sale_id,
-      checkoutId: row.checkout_id || '',
-      status: row.status,
-      bankName: row.bank_name || '',
-      accountName: row.account_name || '',
-      accountNumber: row.account_number || '',
-      payableKobo: row.payable_kobo,
-      cartTotalKobo: row.cart_total_kobo,
-      currency: row.currency || 'NGN',
-      expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null,
-      sale: row.sale_payload,
-    };
+  async options(user: PosJwtPayload) {
+    await this.scope(user, { hub: user.hubId, cashier: user.sub });
+    const hub = await this.hubs.findById(user.hubId).lean();
+    const providers: Array<{ id: PaymentProviderId; name: string }> = [];
+    if (process.env.POS_PAYMENT_RESERVATIONS_ENABLED === 'true' && await this.rolloutReady()) {
+      if (process.env.BACHS_API_KEY) providers.push({ id: 'bachs', name: 'Bachs' });
+      if (process.env.SQUAD_DVA_APPROVED === 'true' && process.env.SQUAD_CONTRACT_VERIFIED === 'true' && process.env.SQUAD_SECRET_KEY) providers.push({ id: 'squad', name: 'Squad' });
+    }
+    return { providers, manualConfirmationEnabled: hub?.pos_manual_payment_confirmation === true };
+  }
+
+  private async scope(user: PosJwtPayload, row: any) {
+    if (String(row.hub) !== user.hubId || (user.role !== 'manager' && String(row.cashier) !== user.sub)) throw new ForbiddenException('This payment is not assigned to you at this location');
+    const actor = await this.users.findById(user.sub).populate('role').lean();
+    const hub = await this.hubs.findById(user.hubId).lean();
+    if (!actor || actor.is_active === false || actor.role?.name !== (user.role === 'manager' ? 'hub_manager' : 'cashier') || !hub || hub.is_active === false
+      || (String(actor.hub) !== user.hubId && !(user.role === 'manager' && String(hub.hub_manager) === user.sub))) {
+      throw new ForbiddenException('Your account is not currently assigned to this location');
+    }
+  }
+
+  private async rolloutReady() {
+    const marker = await this.transfers.db.collection('pos_payment_rollout').findOne({ _id: 'reservations-v1' as any });
+    return marker?.ready === true;
+  }
+
+  private async view(row: any, user?: PosJwtPayload) {
+    const hub = user ? await this.hubs.findById(user.hubId).lean() : null;
+    const unresolved = UNRESOLVED.includes(row.status);
+    return { clientSaleId: row.client_sale_id, checkoutId: row.checkout_id || '', provider: row.provider || 'bachs',
+      status: row.status, bankName: row.bank_name || '', accountName: row.account_name || '', accountNumber: row.account_number || '',
+      payableKobo: row.payable_kobo, cartTotalKobo: row.cart_total_kobo, feeKobo: row.fee_kobo ?? null, currency: row.currency,
+      expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null, sale: row.sale_payload,
+      reservationState: row.reservation_state || 'needs_review', reconciliationReason: row.reconciliation_reason || null,
+      canConfirmReceived: Boolean(user && unresolved && row.reservation_state === 'held' && row.checkout_id && hub?.pos_manual_payment_confirmation === true && (user.role === 'manager' || String(row.cashier) === user.sub)),
+      canCancel: Boolean(user && unresolved), confirmationSource: row.confirmation_source || null };
+  }
+
+  private async email(payload: Record<string, any>, hubId: string) {
+    if (payload.customerId && Types.ObjectId.isValid(payload.customerId)) {
+      const customer = await this.customers.findOne({ _id: payload.customerId, customer_location: hubId }).lean();
+      const email = customer?.customer_email || customer?.email;
+      if (email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return email;
+    }
+    const hub = await this.hubs.findById(hubId).lean();
+    const manager = hub?.hub_manager ? await this.users.findById(hub.hub_manager).lean() : null;
+    if (manager?.is_active !== false && manager?.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(manager.email)) return manager.email;
+    throw new BadRequestException('Add a customer email or assign a location manager with a valid email before using Squad.');
   }
 
   async start(user: PosJwtPayload, payload: Record<string, any>) {
     const clientSaleId = String(payload.clientSaleId || '').trim();
     if (!clientSaleId) throw new BadRequestException('clientSaleId is required');
-    const hubId = String(payload.hubId || payload.storeId || user.hubId || '');
-    if (hubId !== user.hubId) throw new ForbiddenException('This till is bound to another location');
-    const deviceId = String(payload.deviceId || user.deviceId || '');
+    if (!user.deviceId || (payload.deviceId && payload.deviceId !== user.deviceId)) throw new ForbiddenException('Session is scoped to another till');
+    if ((payload.hubId || payload.storeId || user.hubId) !== user.hubId) throw new ForbiddenException('This till is bound to another location');
+    await this.scope(user, { hub: user.hubId, cashier: user.sub });
     const existing = await this.transfers.findOne({ client_sale_id: clientSaleId });
-    if (existing) {
-      if (String(existing.hub) !== hubId) throw new ForbiddenException('This transfer belongs to another location');
-      return this.view(existing);
+    if (existing) { await this.scope(user, existing); return this.view(existing, user); }
+    if (process.env.POS_PAYMENT_RESERVATIONS_ENABLED !== 'true' || !await this.rolloutReady()) throw new ServiceUnavailableException('Reserved payments are not ready. Run the inventory reservation preflight and backfill first.');
+    const providerId: PaymentProviderId = payload.provider || 'bachs';
+    const provider = this.provider(providerId);
+    const email = providerId === 'squad' ? await this.email(payload, user.hubId) : undefined;
+    await this.pos.quoteSale(user, payload);
+    let row: any;
+    try {
+      row = await this.pos.inventoryTransaction(async () => {
+        const reservation = await this.pos.reservePayment(user, payload);
+        const [created] = await this.transfers.create([{
+          client_sale_id: clientSaleId, provider: providerId, hub: new Types.ObjectId(user.hubId), device_id: user.deviceId,
+          cashier: new Types.ObjectId(user.sub), cashier_name: payload.cashierName, status: 'initializing',
+          cart_total_kobo: reservation.snapshot.total, payable_kobo: reservation.snapshot.total, currency: 'NGN',
+          reservation_state: 'held', allocations: reservation.allocations, priced_snapshot: reservation.snapshot,
+          sale_payload: { ...payload, hubId: user.hubId, deviceId: user.deviceId, total: reservation.snapshot.total },
+        }]);
+        return created;
+      });
+    } catch (error: any) {
+      if (error?.code !== 11000) throw error;
+      const duplicate = await this.transfers.findOne({ client_sale_id: clientSaleId });
+      if (!duplicate) throw error;
+      await this.scope(user, duplicate); return this.view(duplicate, user);
     }
-
-    const quote = await this.pos.quoteSale(user, payload);
-    const salePayload = {
-      ...payload,
-      clientSaleId,
-      hubId,
-      deviceId,
-      total: quote.total,
-    };
-    const opened = await this.client().openBankTransfer({
-      clientSaleId,
-      amountKobo: quote.total,
-      hubId,
-      deviceId,
-    });
-    const created = await this.transfers.create({
-      client_sale_id: clientSaleId,
-      checkout_id: opened.checkoutId,
-      hub: new Types.ObjectId(hubId),
-      device_id: deviceId,
-      cashier: Types.ObjectId.isValid(user.sub) ? new Types.ObjectId(user.sub) : undefined,
-      cashier_name: payload.cashierName,
-      status: 'awaiting',
-      cart_total_kobo: quote.total,
-      payable_kobo: opened.payableKobo,
-      currency: opened.currency,
-      bank_name: opened.bankName,
-      account_name: opened.accountName,
-      account_number: opened.accountNumber,
-      expires_at: opened.expiresAt ? new Date(opened.expiresAt) : undefined,
-      sale_payload: salePayload,
-      event_ids: [],
-    });
-    return this.view(created);
+    try {
+      // Never hold a MongoDB transaction open across a provider network call.
+      const opened = await provider.open({ clientSaleId, amountKobo: row.cart_total_kobo, hubId: user.hubId, deviceId: user.deviceId!, email });
+      if (opened.currency !== 'NGN' || !Number.isSafeInteger(opened.payableKobo) || opened.payableKobo < row.cart_total_kobo) throw new ProviderFailure('Provider returned invalid amount or currency; reconcile this payment.', false);
+      const updated = await this.pos.inventoryTransaction(async () => {
+        const current = await this.lock(clientSaleId);
+        current.checkout_id = opened.checkoutId;
+        current.bank_name = opened.bankName; current.account_name = opened.accountName;
+        current.account_number = opened.accountNumber; current.payable_kobo = opened.payableKobo;
+        current.fee_kobo = opened.payableKobo - current.cart_total_kobo;
+        current.expires_at = opened.expiresAt ? new Date(opened.expiresAt) : undefined;
+        if (current.status === 'initializing') current.status = 'awaiting';
+        await current.save(); return current;
+      });
+      // A webhook can arrive before the account-creation response. Replay it after
+      // the expected amount is known, retaining cancelled transactions for review.
+      for (const pending of updated.reconciliation_events || []) await this.applyEvidence(clientSaleId, pending);
+      return this.view(await this.transfers.findById(row._id), user);
+    } catch (error) {
+      await this.pos.inventoryTransaction(async () => {
+        const current = await this.lock(row.client_sale_id);
+        if (current.status !== 'initializing') return;
+        if (error instanceof ProviderFailure && error.definite) {
+          await this.pos.releasePayment(current.allocations); current.reservation_state = 'released'; current.status = 'cancelled';
+        } else current.status = 'review';
+        current.reconciliation_reason = error instanceof Error ? error.message : 'Provider result unknown';
+        await current.save();
+      });
+      return this.view(await this.transfers.findById(row._id), user);
+    }
   }
 
-  async list(user: PosJwtPayload, deviceId?: string) {
-    const filter: Record<string, unknown> = { hub: user.hubId, status: 'awaiting' };
-    if (deviceId) filter.device_id = deviceId;
-    const rows = await this.transfers.find(filter).sort({ createdAt: -1 }).limit(30);
-    return { data: rows.map((row) => this.view(row)) };
+  private async lock(clientSaleId: string) {
+    const row = await this.transfers.findOneAndUpdate({ client_sale_id: clientSaleId }, { $inc: { __v: 1 } }, { new: true });
+    if (!row) throw new NotFoundException('Transfer not found');
+    return row;
+  }
+
+  async list(user: PosJwtPayload, _deviceId?: string) {
+    await this.scope(user, { hub: user.hubId, cashier: user.sub });
+    const filter: any = { hub: user.hubId, status: { $in: UNRESOLVED } };
+    if (user.role !== 'manager') filter.cashier = user.sub;
+    else { delete filter.status; filter.$or = [{ status: { $in: UNRESOLVED } }, { status: 'cancelled', 'reconciliation_events.0': { $exists: true } }]; }
+    const rows = await this.transfers.find(filter).sort({ createdAt: -1 });
+    return { data: await Promise.all(rows.map(row => this.view(row, user))) };
   }
 
   async status(user: PosJwtPayload, clientSaleId: string, refresh: boolean) {
     const row = await this.transfers.findOne({ client_sale_id: clientSaleId });
     if (!row) throw new NotFoundException('Transfer not found');
-    if (String(row.hub) !== user.hubId) throw new ForbiddenException('This transfer belongs to another location');
-    if (row.status !== 'awaiting' || !refresh || !row.checkout_id) return this.view(row);
-
-    const remote = await this.client().getCheckout(row.checkout_id);
-    const read = readTransferInstructions(remote, row.payable_kobo);
-    if (isPaidStatus(read.status)) {
-      const paid = await this.markPaid(row, read.payableKobo || row.payable_kobo, `poll:${row.checkout_id}`);
-      return this.view(paid);
-    }
-    const remoteStatus = read.status.toLowerCase();
-    if (remoteStatus === 'expired') {
-      row.status = 'expired';
-      await row.save();
-    }
-    return this.view(row);
+    await this.scope(user, row);
+    if (refresh && UNRESOLVED.includes(row.status) && row.checkout_id) await this.applyEvidence(row.client_sale_id, await this.provider(row.provider || 'bachs').check(row.checkout_id, row.payable_kobo));
+    return this.view(await this.transfers.findById(row._id), user);
   }
 
   async cancel(user: PosJwtPayload, clientSaleId: string) {
-    const row = await this.transfers.findOne({ client_sale_id: clientSaleId });
-    if (!row) throw new NotFoundException('Transfer not found');
-    if (String(row.hub) !== user.hubId) throw new ForbiddenException('This transfer belongs to another location');
-    if (row.status === 'paid') throw new BadRequestException('This transfer is already paid');
-    if (row.status === 'awaiting') {
-      row.status = 'cancelled';
-      await row.save();
-    }
-    return this.view(row);
-  }
-
-  async handleWebhook(rawBody: string, headers: Record<string, string | string[] | undefined>) {
-    const secret = process.env.BACHS_WEBHOOK_SECRET || '';
-    if (!secret) throw new ServiceUnavailableException('Webhook secret is not set');
-    if (!verifyBachsSignature(rawBody, headers, secret)) {
-      throw new BadRequestException('Invalid webhook signature');
-    }
-    const event = JSON.parse(rawBody) as { id?: string; type?: string; data?: Record<string, unknown> };
-    const eventId = String(event.id || '');
-    if (!eventId) return { received: true };
-    const data = event.data || {};
-    if (event.type === 'checkout.expired') {
-      await this.expire(data);
-      return { received: true };
-    }
-    if (event.type !== 'collection.succeeded' && event.type !== 'checkout.completed') return { received: true };
-
-    const checkoutId = String(data.checkout_id || '');
-    const reference = String(data.reference || '');
-    const row = await this.transfers.findOne(checkoutId
-      ? { checkout_id: checkoutId }
-      : { client_sale_id: reference });
-    if (!row || row.status === 'paid' || row.status === 'cancelled') return { received: true };
-    if (row.event_ids?.includes(eventId)) return { received: true };
-    const paidKobo = nairaToKobo((data.amount as string | number) || 0);
-    if (event.type === 'checkout.completed' && !isPaidStatus(String(data.status || 'succeeded'))) {
-      return { received: true };
-    }
-    await this.markPaid(row, paidKobo, eventId);
-    return { received: true };
-  }
-
-  private async expire(data: Record<string, unknown>) {
-    const checkoutId = String(data.checkout_id || '');
-    if (!checkoutId) return;
-    await this.transfers.updateOne(
-      { checkout_id: checkoutId, status: 'awaiting' },
-      { $set: { status: 'expired' } },
-    );
-  }
-
-  private async markPaid(row: TransferDoc & { save: () => Promise<unknown> }, paidKobo: number, eventId: string) {
-    if (row.status === 'paid') return row;
-    if (paidKobo + 1 < row.payable_kobo) {
-      throw new BadRequestException('The amount received does not cover this transfer');
-    }
-    const payload = row.sale_payload || {};
-    const user: PosJwtPayload = {
-      sub: String(row.cashier || ''),
-      role: 'cashier',
-      hubId: String(row.hub),
-      deviceId: row.device_id,
-    };
-    await this.pos.createSale(user, {
-      ...payload,
-      clientSaleId: row.client_sale_id,
-      hubId: String(row.hub),
-      deviceId: row.device_id,
-      total: row.cart_total_kobo,
-      payments: [{ method: 'Transfer', amount: row.cart_total_kobo, reference: row.checkout_id }],
+    return this.pos.inventoryTransaction(async () => {
+      const row = await this.lock(clientSaleId); await this.scope(user, row);
+      if (row.status === 'paid') throw new ConflictException('Payment already confirmed; this transfer cannot be cancelled');
+      if (row.status !== 'cancelled') {
+        if (row.reservation_state === 'held') await this.pos.releasePayment(row.allocations);
+        row.status = 'cancelled'; row.reservation_state = 'released'; await row.save();
+      }
+      return this.view(row, user);
     });
-    row.status = 'paid';
-    row.paid_at = new Date();
-    row.event_ids = [...(row.event_ids || []), eventId].filter(Boolean);
+  }
+
+  async confirmReceived(user: PosJwtPayload, clientSaleId: string) {
+    return this.pos.inventoryTransaction(async () => {
+      const row = await this.lock(clientSaleId); await this.scope(user, row);
+      const hub = await this.hubs.findById(user.hubId).lean();
+      if (hub?.pos_manual_payment_confirmation !== true) throw new ForbiddenException('Manual payment confirmation is disabled at this location');
+      if (row.status === 'paid') return this.view(row, user);
+      if (!UNRESOLVED.includes(row.status) || !row.checkout_id || row.reservation_state !== 'held') throw new ConflictException('This payment needs reconciliation before it can be confirmed');
+      await this.complete(row, 'manual', user.sub, row.payable_kobo);
+      return this.view(row, user);
+    });
+  }
+
+  private async complete(row: any, source: string, actor: string, amount: number, eventId?: string) {
+    if (row.reservation_state !== 'held' || !row.priced_snapshot) throw new ConflictException('Reconcile the stock reservation before completing this payment');
+    await this.pos.releasePayment(row.allocations);
+    await this.pos.createSale({ sub: String(row.cashier), role: 'cashier', hubId: String(row.hub), deviceId: row.device_id }, {
+      ...row.sale_payload, clientSaleId: row.client_sale_id, hubId: String(row.hub), deviceId: row.device_id,
+      total: row.cart_total_kobo, payments: [{ method: 'Transfer', amount: row.cart_total_kobo, reference: row.checkout_id }],
+    }, row.priced_snapshot);
+    row.status = 'paid'; row.reservation_state = 'consumed'; row.paid_at = new Date();
+    row.confirmation_source = source; row.confirmed_by = actor; row.confirmed_at = new Date(); row.confirmed_amount_kobo = amount;
+    if (eventId) row.event_ids.addToSet(eventId);
     await row.save();
-    return row;
+  }
+
+  private async applyEvidence(clientSaleId: string, evidence: PaymentEvidence) {
+    await this.pos.inventoryTransaction(async () => {
+      const row = await this.lock(clientSaleId);
+      if (row.event_ids?.includes(evidence.eventId) || row.status === 'paid') return;
+      const referenceMatches = evidence.reference === row.checkout_id || evidence.reference === row.client_sale_id;
+      const valid = referenceMatches && evidence.currency === row.currency && Number.isSafeInteger(evidence.amountKobo) && evidence.amountKobo! >= row.payable_kobo;
+      if (evidence.status === 'paid' && valid && UNRESOLVED.includes(row.status) && row.reservation_state === 'held' && row.checkout_id) {
+        await this.complete(row, 'provider', String(row.cashier), evidence.amountKobo!, evidence.eventId); return;
+      }
+      if (evidence.status === 'expired' && UNRESOLVED.includes(row.status)) row.status = 'expired';
+      if (evidence.status === 'paid' || evidence.status === 'review') {
+        row.reconciliation_reason = row.status === 'cancelled' ? 'Payment received after cancellation; stock was released' : 'Provider evidence needs amount, currency, reference or reservation reconciliation';
+        row.reconciliation_events.push({ ...evidence, receivedAt: new Date() });
+        if (row.status !== 'cancelled' && row.status !== 'initializing') row.status = 'review';
+      }
+      if (row.checkout_id && !evidence.eventId.startsWith('poll:') && evidence.status !== 'awaiting') row.event_ids.addToSet(evidence.eventId);
+      await row.save();
+    });
+  }
+
+  async handleWebhook(raw: string, headers: Record<string, string | string[] | undefined>, providerId: PaymentProviderId = 'bachs') {
+    let evidence: PaymentEvidence | null;
+    try { evidence = this.provider(providerId).webhook(raw, headers); }
+    catch { throw new BadRequestException('Invalid payment webhook'); }
+    if (!evidence) return { received: true };
+    const providerFilter = providerId === 'bachs' ? { $or: [{ provider: 'bachs' }, { provider: { $exists: false } }] } : { provider: providerId };
+    const row = await this.transfers.findOne({ $and: [providerFilter, { $or: [{ checkout_id: evidence.reference }, { client_sale_id: evidence.reference }] }] });
+    if (row) {
+      if (providerId === 'squad' && evidence.status === 'paid') {
+        // DVA v2 signs reference and amount but not status. Cross-check status.
+        const checked = await this.provider('squad').check(evidence.reference, row.payable_kobo);
+        if (checked.status !== 'paid') evidence = { ...evidence, status: 'review' };
+      }
+      await this.applyEvidence(row.client_sale_id, evidence);
+    }
+    return { received: true };
   }
 }

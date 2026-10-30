@@ -1,5 +1,7 @@
+import { fenceProduct } from './inventory-guard';
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -47,6 +49,8 @@ type ProductDoc = {
   category?: string;
   unit_of_measure?: string;
   current_stock?: number;
+  reserved_stock?: number;
+  reserved_batches?: Record<string, number>;
   base_selling_price?: number;
   carton_price?: number;
   carton_weight?: number;
@@ -486,7 +490,9 @@ export class PosService {
         price: prices.length ? Math.min(...prices) : nairaToKobo(p.base_selling_price || 0),
         cost: nairaToKobo(p.avg_unit_cost || 0),
         unit: p.unit_of_measure || 'Units',
-        stock: p.current_stock ?? 0,
+        stock: Math.max(0, (p.current_stock ?? 0) - (p.reserved_stock ?? 0)),
+        onHandStock: p.current_stock ?? 0,
+        reservedStock: p.reserved_stock ?? 0,
         trackStock: true,
         isActive: p.is_active !== false,
         batches,
@@ -646,7 +652,7 @@ export class PosService {
     }
     return [...grouped.values()].map((batch) => ({
       batchNumber: batch.batchNumber,
-      quantityRemaining: batch.quantityRemaining,
+      quantityRemaining: Math.max(0, batch.quantityRemaining - Number(product.reserved_batches?.[Buffer.from(batch.batchNumber).toString('hex')] || 0)),
       unitPrice: nairaToKobo(batch.unitPrice || product.base_selling_price || 0),
       cartonPrice: nairaToKobo(batch.cartonPrice || product.carton_price || 0),
       cartonWeight: batch.cartonWeight || Number(product.carton_weight) || 0,
@@ -809,7 +815,9 @@ export class PosService {
       batchNumber: batch,
       notes: 'POS sale',
     });
-    const next = Math.max(0, (Number(product.current_stock) || 0) - qty);
+    const fresh = await this.productModel.findById(product._id);
+    const next = (Number(fresh?.current_stock) || 0) - qty;
+    if (next < 0) throw new BadRequestException('Not enough available stock');
     await this.productModel.updateOne(
       { _id: product._id },
       { $set: { current_stock: next, last_stock_update: new Date() } },
@@ -939,14 +947,77 @@ export class PosService {
     return { data: { id: String(created._id), name: created.customer_name, phone: created.customer_phone } };
   }
 
-  async createSale(user: PosJwtPayload, payload: Record<string, any>) {
+  async inventoryTransaction<T>(work: () => Promise<T>): Promise<T> {
+    if ((this.productModel.base as any).transactionAsyncLocalStorage?.getStore()?.session) return work();
+    return this.productModel.db.transaction(work);
+  }
+
+  async lockPaymentProducts(payload: Record<string, any>) {
+    const ids = [...new Set<string>((payload.items || payload.lines || []).map((line: any) => String(line.productId || line.product || '')))].sort();
+    for (const id of ids) {
+      if (!Types.ObjectId.isValid(id)) throw new BadRequestException('Invalid product');
+      await fenceProduct(this.productModel, new Types.ObjectId(id));
+    }
+  }
+
+  async reservePayment(user: PosJwtPayload, payload: Record<string, any>) {
+    await this.lockPaymentProducts(payload);
+    const priced = await this.priceCart(user.hubId, payload, false);
+    const allocations: Record<string, { quantity: number; batches: Record<string, number> }> = {};
+    for (const line of priced.lines) {
+      const id = String(line.product._id);
+      const a = allocations[id] ||= { quantity: 0, batches: {} };
+      a.quantity += line.stockQuantity;
+      const key = Buffer.from(line.batchNumber).toString('hex');
+      a.batches[key] = (a.batches[key] || 0) + line.stockQuantity;
+    }
+    for (const [id, allocation] of Object.entries(allocations)) {
+      const product = await this.productModel.findById(id);
+      if (!product || Number(product.current_stock || 0) - Number(product.reserved_stock || 0) + 1e-8 < allocation.quantity) {
+        throw new BadRequestException('Insufficient available stock for this payment');
+      }
+      const batches = await this.openBatches(product);
+      for (const [key, qty] of Object.entries(allocation.batches)) {
+        if ((batches.find(b => Buffer.from(b.batchNumber).toString('hex') === key)?.quantityRemaining || 0) + 1e-8 < qty) {
+          throw new BadRequestException('Insufficient available batch stock for this payment');
+        }
+      }
+      const increments: Record<string, number> = { reserved_stock: allocation.quantity };
+      for (const [key, qty] of Object.entries(allocation.batches)) increments['reserved_batches.' + key] = qty;
+      await this.productModel.updateOne({ _id: product._id }, { $inc: increments });
+    }
+    return { snapshot: JSON.parse(JSON.stringify(priced)), allocations };
+  }
+
+  async releasePayment(allocations: Record<string, { quantity: number; batches: Record<string, number> }>) {
+    for (const id of Object.keys(allocations).sort()) {
+      const a = allocations[id];
+      const increments: Record<string, number> = { reserved_stock: -a.quantity };
+      const filter: Record<string, any> = { _id: new Types.ObjectId(id), reserved_stock: { $gte: a.quantity - 1e-8 } };
+      for (const [key, qty] of Object.entries(a.batches)) {
+        increments['reserved_batches.' + key] = -qty;
+        filter['reserved_batches.' + key] = { $gte: qty - 1e-8 };
+      }
+      const result = await this.productModel.updateOne(filter, { $inc: increments });
+      if (result.modifiedCount !== 1) throw new BadRequestException('Reservation mismatch; manager reconciliation is required');
+    }
+  }
+
+  async createSale(user: PosJwtPayload, payload: Record<string, any>, snapshot?: any): Promise<any> {
+    return this.inventoryTransaction(async () => {
+      await this.lockPaymentProducts(payload);
+      return this.createSaleInTransaction(user, payload, snapshot);
+    });
+  }
+
+  private async createSaleInTransaction(user: PosJwtPayload, payload: Record<string, any>, snapshot?: any) {
     const clientSaleId = String(payload.clientSaleId || payload.id || '').trim();
     if (!clientSaleId) throw new BadRequestException('clientSaleId is required');
     const hubId = this.assertJwtHub(user, payload.hubId || payload.storeId || user.hubId);
     if (!user.deviceId || (payload.deviceId && payload.deviceId !== user.deviceId)) {
       throw new ForbiddenException('Session is scoped to another till');
     }
-    await this.requireBoundDevice(user.deviceId, hubId);
+    if (!snapshot) await this.requireBoundDevice(user.deviceId, hubId);
 
     const existing = await this.saleModel.findOne({ client_sale_id: clientSaleId }).lean();
     if (existing) {
@@ -956,7 +1027,10 @@ export class PosService {
       return { data: existing, idempotent: true };
     }
 
-    const priced = await this.priceCart(hubId, payload, true);
+    if (!snapshot && await this.productModel.db.model('PosTransfer').exists({ client_sale_id: clientSaleId })) {
+      throw new ConflictException('This sale is locked to an existing payment. Confirm or cancel that payment.');
+    }
+    const priced = snapshot || await this.priceCart(hubId, payload, true);
     const mappedItems = priced.lines.map((line) => ({
       product: line.product._id,
       product_name: line.name,
@@ -1026,7 +1100,11 @@ export class PosService {
     return { data: created };
   }
 
-  private async createReversal(
+  private async createReversal(user: PosJwtPayload, originalClientId: string, payload: Record<string, any>, kind: 'refund' | 'void') {
+    return this.inventoryTransaction(() => this.createReversalInTransaction(user, originalClientId, payload, kind));
+  }
+
+  private async createReversalInTransaction(
     user: PosJwtPayload,
     originalClientId: string,
     payload: Record<string, any>,
