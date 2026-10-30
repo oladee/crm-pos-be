@@ -147,7 +147,8 @@ export class PosPasskeyService {
       attestationType: 'none',
       authenticatorSelection: {
         authenticatorAttachment: 'platform',
-        residentKey: 'preferred',
+        residentKey: 'discouraged',
+        requireResidentKey: false,
         userVerification: 'required',
       },
       preferredAuthenticatorType: 'localDevice',
