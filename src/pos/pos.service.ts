@@ -942,18 +942,20 @@ export class PosService {
     const name = String(input.name || '').trim();
     const phone = String(input.phone || '').trim();
     if (!name) throw new BadRequestException('Customer name is required');
-    if (!/^\+?\d{7,15}$/.test(phone)) throw new BadRequestException('Enter a phone number for this customer');
-    const existing = await this.customerModel.findOne({ customer_phone: phone });
-    if (existing) {
-      if (String(existing.customer_location) !== hubId) {
-        throw new BadRequestException('This phone already belongs to a customer at another location');
+    if (phone) {
+      if (!/^\+?\d{7,15}$/.test(phone)) throw new BadRequestException('Enter a phone number for this customer');
+      const existing = await this.customerModel.findOne({ customer_phone: phone });
+      if (existing) {
+        if (String(existing.customer_location) !== hubId) {
+          throw new BadRequestException('This phone already belongs to a customer at another location');
+        }
+        return { data: { id: String(existing._id), name: existing.customer_name, phone: existing.customer_phone } };
       }
-      return { data: { id: String(existing._id), name: existing.customer_name, phone: existing.customer_phone } };
     }
     const created = await this.customerModel.create({
       customer_type: 'b2c',
       customer_name: name,
-      customer_phone: phone,
+      ...(phone ? { customer_phone: phone } : {}),
       customer_location: oid(hubId, 'hubId'),
       assigned_agent: oid(user.sub, 'cashier'),
       added_by: oid(user.sub, 'cashier'),

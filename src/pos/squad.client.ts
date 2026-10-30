@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from 'crypto';
-import { PaymentEvidence, PaymentProvider, ProviderFailure, TransferInstructions } from './payment-provider';
+import { PaymentEvidence, PaymentProvider, ProviderFailure, TRANSFER_STAFF_EMAIL_REQUIRED, TransferInstructions } from './payment-provider';
 import { nairaToKobo } from './bachs.client';
 
 // DVA v2 contract: https://squadinc.gitbook.io/virtual-accounts/reference/dynamic-virtual-account-v2
@@ -27,7 +27,7 @@ export class SquadClient implements PaymentProvider {
   }
 
   async open(input: { clientSaleId: string; amountKobo: number; email?: string }): Promise<TransferInstructions> {
-    if (!input.email) throw new ProviderFailure('Add a customer email or assign a manager with an email to this location.', true);
+    if (!input.email) throw new ProviderFailure(TRANSFER_STAFF_EMAIL_REQUIRED, true);
     const data = await this.request('/virtual-account/initiate-dynamic-virtual-account', {
       amount: input.amountKobo, duration: 7200, email: input.email,
       transaction_ref: input.clientSaleId, pass_charge: true,

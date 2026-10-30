@@ -1,12 +1,15 @@
 import { createServer, Server } from 'http';
 import { Logger } from '@nestjs/common';
 import { BachsClient } from './bachs.client';
-import { TRANSFER_INSTRUCTIONS_MISSING, TRANSFER_START_REJECTED } from './payment-provider';
+import { TRANSFER_INSTRUCTIONS_MISSING, TRANSFER_STAFF_EMAIL_REQUIRED, TRANSFER_START_REJECTED } from './payment-provider';
 
 describe('Bachs checkout through real HTTP', () => {
   let server: Server, client: BachsClient, requests: any[], warns: any[];
   let reply: (req: { method?: string; path: string }) => { httpStatus?: number; body: any };
-  const open = () => client.openBankTransfer({ clientSaleId: 'sale-1', amountKobo: 10000, hubId: 'hub-1', deviceId: 'device-1' });
+  const open = (input: { email?: string; name?: string } = {}) => client.openBankTransfer({
+    clientSaleId: 'sale-1', amountKobo: 10000, hubId: 'hub-1', deviceId: 'device-1',
+    email: 'cashier@example.com', name: 'Ada', ...input,
+  });
 
   beforeAll(async () => {
     server = createServer(async (req, res) => {
@@ -31,6 +34,25 @@ describe('Bachs checkout through real HTTP', () => {
     };
   });
   afterEach(() => jest.restoreAllMocks());
+
+  it('sends customer identity and NGN base currency on create', async () => {
+    await open();
+    expect(requests[0]).toMatchObject({
+      method: 'POST',
+      path: '/v1/checkout-sessions',
+      body: {
+        ui_mode: 'custom',
+        pricing: { base_currency: 'NGN', amount: '100.00' },
+        customer: { email: 'cashier@example.com', name: 'Ada' },
+        payment_method_types: ['NGN_BANK_TRANSFER'],
+      },
+    });
+  });
+
+  it('does not contact Bachs without an email', async () => {
+    await expect(open({ email: '' })).rejects.toMatchObject({ definite: true, message: TRANSFER_STAFF_EMAIL_REQUIRED });
+    expect(requests).toHaveLength(0);
+  });
 
   it('keeps nested Bachs 400 details in logs and throws a cashier message', async () => {
     reply = () => ({ httpStatus: 400, body: { error: { message: 'pricing.amount is invalid', details: 'amount must be a string' }, code: 'invalid_request' } });

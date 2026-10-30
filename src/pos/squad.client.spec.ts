@@ -1,7 +1,7 @@
 import { createServer, Server } from 'http';
 import { createHmac } from 'crypto';
 import { SquadClient } from './squad.client';
-import { ProviderFailure } from './payment-provider';
+import { ProviderFailure, TRANSFER_STAFF_EMAIL_REQUIRED } from './payment-provider';
 
 describe('Squad DVA contract through real HTTP', () => {
   let server: Server, client: SquadClient, requests: any[];
@@ -24,7 +24,7 @@ describe('Squad DVA contract through real HTTP', () => {
     expect(requests[0]).toMatchObject({ method: 'POST', path: '/virtual-account/initiate-dynamic-virtual-account', authorization: 'Bearer sandbox_test_secret', body: { amount: 10000, pass_charge: true, email: 'buyer@example.com', transaction_ref: 'sale-1' } });
   });
   it('requires email before contacting the provider', async () => {
-    await expect(client.open({ clientSaleId: 'sale-1', amountKobo: 10000 })).rejects.toMatchObject({ definite: true });
+    await expect(client.open({ clientSaleId: 'sale-1', amountKobo: 10000 })).rejects.toMatchObject({ definite: true, message: TRANSFER_STAFF_EMAIL_REQUIRED });
     expect(requests).toHaveLength(0);
   });
   it.each([{ expected_amount: undefined }, { currency: 'USD' }, { transaction_reference: 'other-sale' }, { expected_amount: '1.00' }])('retains stock for an incomplete or inconsistent provider response: %j', async change => {

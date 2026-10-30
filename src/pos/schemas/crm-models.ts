@@ -111,7 +111,7 @@ export const CustomerSchema = new Schema(
     customer_email: String,
     customer_type: { type: String, required: true },
     customer_name: { type: String, required: true },
-    customer_phone: { type: String, required: true },
+    customer_phone: String,
     customer_location: { type: Schema.Types.ObjectId, ref: 'Hub', required: true },
     assigned_agent: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     added_by: { type: Schema.Types.ObjectId, ref: 'User', required: true },

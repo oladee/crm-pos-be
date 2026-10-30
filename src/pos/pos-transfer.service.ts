@@ -6,7 +6,7 @@ import { PosService } from './pos.service';
 import { paymentLogText } from './payment-log';
 import { BachsProvider } from './bachs-provider';
 import { SquadClient } from './squad.client';
-import { PaymentEvidence, PaymentProvider, PaymentProviderId, ProviderFailure, TRANSFER_NEEDS_REVIEW } from './payment-provider';
+import { PaymentEvidence, PaymentProvider, PaymentProviderId, ProviderFailure, TRANSFER_NEEDS_REVIEW, TRANSFER_STAFF_EMAIL_REQUIRED } from './payment-provider';
 
 const UNRESOLVED = ['initializing', 'awaiting', 'expired', 'review'];
 
@@ -65,16 +65,20 @@ export class PosTransferService {
       canCancel: Boolean(user && unresolved), confirmationSource: row.confirmation_source || null };
   }
 
-  private async email(payload: Record<string, any>, hubId: string) {
-    if (payload.customerId && Types.ObjectId.isValid(payload.customerId)) {
-      const customer = await this.customers.findOne({ _id: payload.customerId, customer_location: hubId }).lean();
-      const email = customer?.customer_email || customer?.email;
-      if (email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return email;
-    }
-    const hub = await this.hubs.findById(hubId).lean();
-    const manager = hub?.hub_manager ? await this.users.findById(hub.hub_manager).lean() : null;
-    if (manager?.is_active !== false && manager?.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(manager.email)) return manager.email;
-    throw new BadRequestException('Add a customer email or assign a location manager with a valid email before using Squad.');
+  private validEmail(value: unknown) {
+    const email = String(value || '').trim();
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : '';
+  }
+
+  private async buyerIdentity(payload: Record<string, any>, user: PosJwtPayload) {
+    const customer = payload.customerId && Types.ObjectId.isValid(payload.customerId)
+      ? await this.customers.findOne({ _id: payload.customerId, customer_location: user.hubId }).lean()
+      : null;
+    const staff = await this.users.findById(user.sub).lean();
+    const email = this.validEmail(customer?.customer_email || customer?.email) || this.validEmail(staff?.email);
+    if (!email) throw new BadRequestException(TRANSFER_STAFF_EMAIL_REQUIRED);
+    const name = String(payload.customerName || customer?.customer_name || staff?.full_name || email).trim();
+    return { email, name };
   }
 
   async start(user: PosJwtPayload, payload: Record<string, any>) {
@@ -99,7 +103,7 @@ export class PosTransferService {
     const providerId: PaymentProviderId = payload.provider || 'bachs';
     stage = 'provider_configuration';
     const provider = this.provider(providerId);
-    const email = providerId === 'squad' ? await this.email(payload, user.hubId) : undefined;
+    const identity = await this.buyerIdentity(payload, user);
     stage = 'quote';
     await this.pos.quoteSale(user, payload);
     stage = 'reservation';
@@ -126,7 +130,7 @@ export class PosTransferService {
       // Never hold a MongoDB transaction open across a provider network call.
       stage = 'provider_open';
       this.logger.log({ event: 'transfer.provider_open', ...context, amountKobo: row.cart_total_kobo });
-      const opened = await provider.open({ clientSaleId, amountKobo: row.cart_total_kobo, hubId: user.hubId, deviceId: user.deviceId!, email });
+      const opened = await provider.open({ clientSaleId, amountKobo: row.cart_total_kobo, hubId: user.hubId, deviceId: user.deviceId!, email: identity.email, name: identity.name });
       if (opened.currency !== 'NGN' || !Number.isSafeInteger(opened.payableKobo) || opened.payableKobo < row.cart_total_kobo) throw new ProviderFailure('Provider returned invalid amount or currency; reconcile this payment.', false);
       stage = 'save_instructions';
       const updated = await this.pos.inventoryTransaction(async () => {

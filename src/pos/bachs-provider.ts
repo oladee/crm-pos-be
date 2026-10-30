@@ -3,7 +3,9 @@ import { verifyBachsSignature } from './bachs-signature';
 import { PaymentEvidence, PaymentProvider } from './payment-provider';
 export class BachsProvider implements PaymentProvider {
   constructor(private readonly key: string, private readonly secret: string) {}
-  open(input: { clientSaleId: string; amountKobo: number; hubId: string; deviceId: string }) { return new BachsClient(this.key).openBankTransfer(input); }
+  open(input: { clientSaleId: string; amountKobo: number; hubId: string; deviceId: string; email?: string; name?: string }) {
+    return new BachsClient(this.key).openBankTransfer(input);
+  }
   async check(reference: string): Promise<PaymentEvidence> {
     const result = await new BachsClient(this.key).getCheckout(reference);
     const data = (result.data || result) as Record<string, any>;

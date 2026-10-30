@@ -32,7 +32,7 @@ describe('payment reservations with real MongoDB transactions', () => {
     other.model('Product', ProductSchema.clone()); other.model('StockLog', StockLogSchema.clone());
     await Promise.all(Object.values(db.models).map(model => model.init()));
     pos = Object.create(PosService.prototype);
-    Object.assign(pos, { productModel: products, stockLogModel: logs, saleModel: sales, deviceModel: devices, hubModel: hubs });
+    Object.assign(pos, { productModel: products, stockLogModel: logs, saleModel: sales, deviceModel: devices, hubModel: hubs, customerModel: customers });
     service = new PosTransferService(transfers, pos, hubs, users, customers);
     provider = { open: jest.fn(async input => ({ checkoutId: input.clientSaleId, payableKobo: input.amountKobo + 100,
       bankName: 'Test Bank', accountName: 'Test Store', accountNumber: '0123456789', currency: 'NGN' })),
@@ -145,12 +145,18 @@ describe('payment reservations with real MongoDB transactions', () => {
     expect(timeout.reconciliationReason).toBe(TRANSFER_NEEDS_REVIEW);
     expect((await products.findById(product)).reserved_stock).toBe(2);
   });
-  it('uses the customer email or manager email, and blocks a missing email', async () => {
-    const customer = await db.model('Customer').create({ customer_name: 'Buyer', customer_location: hub, customer_email: 'buyer@example.com', customer_type: 'Individual', customer_phone: '08000000000', assigned_agent: cashier, added_by: cashier });
-    expect(await (service as any).email({ customerId: String(customer._id) }, String(hub))).toBe('buyer@example.com');
-    expect(await (service as any).email({}, String(hub))).toBe('manager@example.com');
-    await users.updateOne({ _id: manager }, { $unset: { email: 1 } });
-    await expect((service as any).email({}, String(hub))).rejects.toThrow(/email/);
+  it('uses the customer email or staff email, and blocks a missing staff email', async () => {
+    const customer = await db.model('Customer').create({ customer_name: 'Buyer', customer_location: hub, customer_email: 'buyer@example.com', customer_type: 'Individual', assigned_agent: cashier, added_by: cashier });
+    expect(await (service as any).buyerIdentity({ customerId: String(customer._id) }, actor)).toEqual({ email: 'buyer@example.com', name: 'Buyer' });
+    expect(await (service as any).buyerIdentity({ customerName: 'Walk-in' }, actor)).toEqual({ email: 'cashier@example.com', name: 'Walk-in' });
+    await users.updateOne({ _id: cashier }, { $unset: { email: 1 } });
+    await expect((service as any).buyerIdentity({}, actor)).rejects.toThrow(/till account needs an email/);
+  });
+  it('creates a customer with a name only', async () => {
+    const created = await pos.createCustomer(actor, { name: 'Ada' });
+    expect(created.data).toMatchObject({ name: 'Ada' });
+    expect(created.data.phone).toBeFalsy();
+    await expect(pos.createCustomer(actor, { name: 'Ada', phone: 'nope' })).rejects.toThrow(/phone/);
   });
   it('rolls back stock release and sale creation if finalization fails', async () => {
     await service.start(actor, payload('rollback'));

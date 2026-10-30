@@ -1,6 +1,6 @@
 import { Logger, ServiceUnavailableException } from '@nestjs/common';
 import { paymentLogError, paymentLogText, paymentLogValidationFields } from './payment-log';
-import { ProviderFailure, TRANSFER_INSTRUCTIONS_MISSING, TRANSFER_START_REJECTED } from './payment-provider';
+import { ProviderFailure, TRANSFER_INSTRUCTIONS_MISSING, TRANSFER_STAFF_EMAIL_REQUIRED, TRANSFER_START_REJECTED } from './payment-provider';
 
 export type BachsInstructions = {
   checkoutId: string;
@@ -133,10 +133,14 @@ export class BachsClient {
     return json;
   }
 
-  async openBankTransfer(input: { clientSaleId: string; amountKobo: number; hubId: string; deviceId: string }) {
+  async openBankTransfer(input: { clientSaleId: string; amountKobo: number; hubId: string; deviceId: string; email?: string; name?: string }) {
+    const email = String(input.email || '').trim();
+    const name = String(input.name || email).trim();
+    if (!email) throw new ProviderFailure(TRANSFER_STAFF_EMAIL_REQUIRED, true);
     const created = await this.request('POST', '/v1/checkout-sessions', {
       ui_mode: 'custom',
-      pricing: { currency: 'NGN', amount: koboToNairaString(input.amountKobo) },
+      pricing: { base_currency: 'NGN', amount: koboToNairaString(input.amountKobo) },
+      customer: { email, name },
       payment_method_types: ['NGN_BANK_TRANSFER'],
       reference: input.clientSaleId,
       expires_in_minutes: 120,
