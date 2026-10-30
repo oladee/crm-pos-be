@@ -1,5 +1,6 @@
-import { BadRequestException, ServiceUnavailableException } from '@nestjs/common';
-import { ProviderFailure } from './payment-provider';
+import { Logger, ServiceUnavailableException } from '@nestjs/common';
+import { paymentLogError, paymentLogText, paymentLogValidationFields } from './payment-log';
+import { ProviderFailure, TRANSFER_INSTRUCTIONS_MISSING, TRANSFER_START_REJECTED } from './payment-provider';
 
 export type BachsInstructions = {
   checkoutId: string;
@@ -84,28 +85,51 @@ export function isPaidStatus(status: string) {
 }
 
 export class BachsClient {
-  constructor(private readonly apiKey: string) {}
+  private readonly logger = new Logger(BachsClient.name);
+  constructor(private readonly apiKey: string, private readonly origin = bachsBaseUrl(apiKey)) {}
 
   private async request(method: string, path: string, body?: Json, idempotencyKey?: string) {
+    const started = Date.now();
+    const operation = method === 'PATCH' ? 'select_payment_method' : path.endsWith('/confirm') ? 'confirm_checkout' : method === 'GET' ? 'get_checkout' : 'create_checkout';
+    const pricing = body?.pricing && typeof body.pricing === 'object' ? body.pricing as Json : undefined;
+    const context = {
+      provider: 'bachs',
+      operation,
+      method,
+      path,
+      env: this.apiKey.startsWith('sk_live_') ? 'live' : 'sandbox',
+      reference: paymentLogText(idempotencyKey || path.split('/')[3] || ''),
+      ...(pricing?.amount != null ? { amountNaira: paymentLogText(pricing.amount as string | number) } : {}),
+    };
+    this.logger.log({ event: 'bachs.request', ...context });
     const headers: Record<string, string> = { Authorization: `Bearer ${this.apiKey}` };
     if (body) headers['Content-Type'] = 'application/json';
     if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
     let res: Response;
     try {
-      res = await fetch(`${bachsBaseUrl(this.apiKey)}${path}`, {
+      res = await fetch(`${this.origin}${path}`, {
         method,
         headers,
         body: body ? JSON.stringify(body) : undefined,
         signal: AbortSignal.timeout(20_000),
       });
-    } catch {
-      throw new ProviderFailure('Bachs response is unknown. Check this payment before trying again.', false);
+    } catch (error) {
+      this.logger.warn({ event: 'bachs.network_failed', ...context, elapsedMs: Date.now() - started,
+        errorType: error instanceof Error ? error.name : 'UnknownError' });
+      throw new ProviderFailure(TRANSFER_START_REJECTED, false);
     }
     const json = (await res.json().catch(() => ({}))) as Json;
+    const responseKeys = Object.keys(json).slice(0, 30).map(paymentLogText);
+    const responseContext = { ...context, httpStatus: res.status, elapsedMs: Date.now() - started,
+      providerRequestId: paymentLogText(res.headers.get('x-request-id') || res.headers.get('request-id') || ''),
+      responseKeys, hasCheckoutId: Boolean(json.checkout_id || json.id) };
     if (!res.ok) {
-      const message = String(json.message || json.error || `Bachs returned ${res.status}`);
-      throw new ProviderFailure(message, [400, 401, 403, 404, 422].includes(res.status));
+      this.logger.warn({ event: 'bachs.response_failed', ...responseContext,
+        providerError: paymentLogError(json),
+        validationFields: paymentLogValidationFields(json.errors) });
+      throw new ProviderFailure(TRANSFER_START_REJECTED, [400, 401, 403, 404, 422].includes(res.status));
     }
+    this.logger.log({ event: 'bachs.response_ok', ...responseContext });
     return json;
   }
 
@@ -119,7 +143,12 @@ export class BachsClient {
       metadata: { hubId: input.hubId, deviceId: input.deviceId, clientSaleId: input.clientSaleId },
     }, input.clientSaleId);
     const checkoutId = String(created.checkout_id || created.id || '');
-    if (!checkoutId) throw new BadRequestException('Bachs did not return a checkout');
+    if (!checkoutId) {
+      this.logger.warn({ event: 'bachs.instructions_missing', provider: 'bachs', operation: 'create_checkout',
+        responseKeys: Object.keys(created).slice(0, 30).map(paymentLogText),
+        hasCheckoutId: false, hasAccountNumber: false, hasBankName: false });
+      throw new ProviderFailure(TRANSFER_INSTRUCTIONS_MISSING, true);
+    }
 
     const priced = await this.request('PATCH', `/v1/checkout-sessions/${checkoutId}`, {
       payment_method: 'NGN_BANK_TRANSFER',
@@ -129,7 +158,10 @@ export class BachsClient {
     const confirmed = await this.request('POST', `/v1/checkout-sessions/${checkoutId}/confirm`, {});
     const instructions = readTransferInstructions({ ...priced, ...confirmed }, input.amountKobo);
     if (!instructions.accountNumber) {
-      throw new BadRequestException('Bachs did not return a bank account for this transfer');
+      this.logger.warn({ event: 'bachs.instructions_missing', provider: 'bachs', operation: 'confirm_checkout',
+        responseKeys: Object.keys({ ...priced, ...confirmed }).slice(0, 30).map(paymentLogText),
+        hasCheckoutId: true, hasAccountNumber: false, hasBankName: Boolean(instructions.bankName) });
+      throw new ProviderFailure(TRANSFER_INSTRUCTIONS_MISSING, true);
     }
     return { ...instructions, checkoutId };
   }

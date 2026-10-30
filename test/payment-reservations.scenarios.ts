@@ -8,7 +8,7 @@ import { PosTransferService } from '../src/pos/pos-transfer.service';
 import { ProductSchema, StockLogSchema, HubSchema, UserSchema, CustomerSchema, SaleSchema, RoleSchema } from '../src/pos/schemas/crm-models';
 import { PosDeviceSchema, PosTransferSchema } from '../src/pos/schemas/pos-models';
 import { PosJwtPayload } from '../src/pos/pos-auth';
-import { ProviderFailure } from '../src/pos/payment-provider';
+import { ProviderFailure, TRANSFER_NEEDS_REVIEW } from '../src/pos/payment-provider';
 
 jest.setTimeout(600_000);
 describe('payment reservations with real MongoDB transactions', () => {
@@ -136,10 +136,13 @@ describe('payment reservations with real MongoDB transactions', () => {
   });
   it('releases definitive initialization failures but retains ambiguous failures', async () => {
     provider.open.mockRejectedValueOnce(new ProviderFailure('Rejected', true));
-    expect((await service.start(actor, payload('rejected'))).status).toBe('cancelled');
+    await expect(service.start(actor, payload('rejected'))).rejects.toThrow('Rejected');
+    expect((await transfers.findOne({ client_sale_id: 'rejected' })).status).toBe('cancelled');
     expect((await products.findById(product)).reserved_stock).toBe(0);
     provider.open.mockRejectedValueOnce(new ProviderFailure('Timeout', false));
-    expect((await service.start(actor, payload('timeout'))).status).toBe('review');
+    const timeout = await service.start(actor, payload('timeout'));
+    expect(timeout.status).toBe('review');
+    expect(timeout.reconciliationReason).toBe(TRANSFER_NEEDS_REVIEW);
     expect((await products.findById(product)).reserved_stock).toBe(2);
   });
   it('uses the customer email or manager email, and blocks a missing email', async () => {

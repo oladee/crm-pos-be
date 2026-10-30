@@ -15,6 +15,10 @@ export type PaymentEvidence = {
   amountKobo?: number;
   currency?: string;
 };
+export const TRANSFER_START_REJECTED = 'This bank transfer could not be started. Try again or use another payment method.';
+export const TRANSFER_INSTRUCTIONS_MISSING = 'Bank account details were not returned. Try again or use another payment method.';
+export const TRANSFER_NEEDS_REVIEW = 'This payment needs checking before you retry. Do not start a new transfer for the same sale.';
+
 export class ProviderFailure extends Error {
   constructor(message: string, public readonly definite: boolean) { super(message); }
 }
