@@ -54,8 +54,27 @@ export class PosPasskeyService {
   constructor(
     @InjectModel('PosDevice') private readonly deviceModel: Model<DeviceDoc>,
     @InjectModel('PosEnrollmentCode') private readonly codeModel: Model<CodeDoc>,
+    @InjectModel('PosTillSequence') private readonly sequenceModel: Model<{ value: number }>,
     @InjectModel('PosWebauthnChallenge') private readonly challengeModel: Model<any>,
   ) {}
+
+  private async tillLabel(hub: Types.ObjectId, existing: DeviceDoc | null) {
+    if (existing && String(existing.hub) === String(hub) && /^Till [1-9]\d*$/.test(existing.label || '')) {
+      return existing.label;
+    }
+    const devices = await this.deviceModel.find({ hub }).lean();
+    const highest = devices.reduce((max, device) => {
+      const match = /^Till ([1-9]\d*)$/.exec(device.label || '');
+      return match ? Math.max(max, Number(match[1])) : max;
+    }, 0);
+    // Reserve numbers atomically, including simultaneous enrollments at this hub.
+    const sequence = await this.sequenceModel.findOneAndUpdate(
+      { _id: hub },
+      [{ $set: { value: { $add: [{ $max: [{ $ifNull: ['$value', 0] }, highest] }, 1] } } }],
+      { upsert: true, new: true, updatePipeline: true },
+    );
+    return `Till ${sequence!.value}`;
+  }
 
   private rpID() {
     if (process.env.POS_RP_ID) return process.env.POS_RP_ID;
@@ -190,7 +209,7 @@ export class PosPasskeyService {
     const claimed = await this.claimCode(input.code);
     const fields = {
       hub: claimed.hub,
-      label: input.label || row.label || existing?.label,
+      label: await this.tillLabel(claimed.hub, existing),
       last_seen: now,
       credential_id: credential.id,
       public_key: isoBase64URL.fromBuffer(credential.publicKey),

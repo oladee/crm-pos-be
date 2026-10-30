@@ -121,3 +121,8 @@ export const PosTransferSchema = new Schema(
   },
   { collection: 'pos_transfers', timestamps: true },
 );
+
+export const PosTillSequenceSchema = new Schema(
+  { _id: { type: Schema.Types.ObjectId, ref: 'Hub' }, value: Number },
+  { collection: 'pos_till_sequences', versionKey: false },
+);

@@ -19,6 +19,7 @@ import {
 import {
   PosAssistSchema,
   PosDeviceSchema,
+  PosTillSequenceSchema,
   PosEnrollmentCodeSchema,
   PosShiftSchema,
   PosStockCountSchema,
@@ -40,6 +41,7 @@ import {
       { name: 'PosAssist', schema: PosAssistSchema },
       { name: 'PosStockCount', schema: PosStockCountSchema },
       { name: 'PosDevice', schema: PosDeviceSchema },
+      { name: 'PosTillSequence', schema: PosTillSequenceSchema },
       { name: 'PosEnrollmentCode', schema: PosEnrollmentCodeSchema },
       { name: 'PosWebauthnChallenge', schema: PosWebauthnChallengeSchema },
       { name: 'PosTransfer', schema: PosTransferSchema },

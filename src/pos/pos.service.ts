@@ -509,7 +509,7 @@ export class PosService {
     }
     const now = new Date();
     existing.last_seen = now;
-    if (dto.label) existing.label = dto.label;
+    // Enrollment owns the label; browser defaults must not overwrite it.
     await existing.save();
     const doc = existing;
     return {
