@@ -396,6 +396,9 @@ export class PosService {
     if (refId(user.hub) === String(hub._id) || refId(hub.hub_manager) === String(user._id)) {
       return hub;
     }
+    if ((user.role as RoleDoc | undefined)?.name === 'hub_manager') {
+      throw new ForbiddenException('You cannot sign in to this till because you are not assigned to manage this location. Use a till at your assigned location or ask an administrator to check your location assignment.');
+    }
     throw new ForbiddenException('Your staff account is not assigned to this till’s location. Ask a manager to check your location assignment.');
   }
 
