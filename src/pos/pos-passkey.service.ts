@@ -222,6 +222,8 @@ export class PosPasskeyService {
     const doc = existing
       ? await this.deviceModel.findOneAndUpdate({ device_id: id }, { $set: fields }, { new: true })
       : await this.deviceModel.create({ device_id: id, bound_at: now, ...fields });
+    // Assertions started for the old credential cannot survive re-enrollment.
+    await this.challengeModel.deleteMany({ device_id: id, kind: 'authentication' });
     return {
       deviceId: id,
       hubId: String(claimed.hub),
