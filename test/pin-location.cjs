@@ -1,0 +1,23 @@
+const assert = require('node:assert/strict');
+const { readFileSync } = require('node:fs');
+const { resolve } = require('node:path');
+const source = readFileSync(resolve(__dirname, '../src/pos/pos.service.ts'), 'utf8');
+const start = source.indexOf('    // Resolve the device');
+const end = source.indexOf('\n  async verifyPin(', start);
+const body = source.slice(start, end).replace(/\n  }\s*$/, '');
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const check = new AsyncFunction('user', 'tillHubId', 'refId', 'ForbiddenException', body);
+const refId = value => value == null ? null : String(value._id || value);
+(async () => {
+  const hub = { _id: 'lagos', hub_manager: 'manager-1' };
+  const state = { getHub: async id => { assert.equal(id, 'lagos'); return hub; } };
+  const run = user => check.call(state, user, 'lagos', refId, Error);
+  assert.equal(await run({ _id: 'cashier-1', hub: 'lagos' }), hub);
+  assert.equal(await run({ _id: 'manager-1', hub: 'abuja' }), hub);
+  assert.equal(await run({ _id: 'manager-1' }), hub);
+  assert.equal(await run({ _id: 'cashier-1', hub: { _id: 'lagos' } }), hub);
+  await assert.rejects(() => run({ _id: 'cashier-2', hub: 'abuja' }), /staff account is not assigned/);
+  await assert.rejects(() => run({ _id: 'unassigned' }), /staff account is not assigned/);
+  assert.ok(source.includes('this.getHubForUser(user, String(registered.hub))'));
+  console.log('Passed: assigned cashier, manager with different default hub, manager without default hub, populated hub, unrelated and unassigned staff rejected; PIN uses server device location.');
+})().catch(error => { console.error(error); process.exitCode = 1; });

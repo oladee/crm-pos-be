@@ -389,15 +389,14 @@ export class PosService {
     }
   }
 
-  private async getHubForUser(user: UserDoc) {
-    const userHub = refId(user.hub);
-    if (userHub) return this.getHub(userHub);
-    const managed = await this.hubModel.findOne({
-      hub_manager: user._id,
-      is_active: { $ne: false },
-    }).lean();
-    if (managed) return managed;
-    throw new UnauthorizedException('Staff is not assigned to a location');
+  private async getHubForUser(user: UserDoc, tillHubId: string) {
+    // Resolve the device's location first: a manager can manage several locations,
+    // and their default user.hub need not be this till's location.
+    const hub = await this.getHub(tillHubId);
+    if (refId(user.hub) === String(hub._id) || refId(hub.hub_manager) === String(user._id)) {
+      return hub;
+    }
+    throw new ForbiddenException('Your staff account is not assigned to this till’s location. Ask a manager to check your location assignment.');
   }
 
   async verifyPin(dto: {
@@ -437,10 +436,7 @@ export class PosService {
     }
     if (!user || user.is_active === false) throw new UnauthorizedException('Invalid PIN');
 
-    const hub = await this.getHubForUser(user);
-    if (String(registered.hub) !== String(hub._id)) {
-      throw new ForbiddenException('This till is bound to another location');
-    }
+    const hub = await this.getHubForUser(user, String(registered.hub));
 
     const role = user.role as RoleDoc | undefined;
     const mapped = this.toStaff(user, role?.name, String(hub._id));
