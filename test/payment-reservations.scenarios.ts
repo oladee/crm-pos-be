@@ -18,7 +18,7 @@ describe('payment reservations with real MongoDB transactions', () => {
   const cashierRole = new Types.ObjectId(), managerRole = new Types.ObjectId();
   const hub = new Types.ObjectId(), cashier = new Types.ObjectId(), manager = new Types.ObjectId(), product = new Types.ObjectId();
   const actor: PosJwtPayload = { sub: String(cashier), role: 'cashier', hubId: String(hub), deviceId: 'device-1' };
-  const payload = (id: string, quantity = 2) => ({ clientSaleId: id, hubId: String(hub), deviceId: actor.deviceId, lines: [{ productId: String(product), batchNumber: 'B1', saleUnit: 'Units', qty: quantity }] });
+  const payload = (id: string, quantity = 2) => ({ clientSaleId: id, hubId: String(hub), deviceId: actor.deviceId, lines: [{ productId: String(product), saleUnit: 'Units', qty: quantity }] });
 
   beforeAll(async () => {
     mongoose.set('transactionAsyncLocalStorage', true);
@@ -72,7 +72,7 @@ describe('payment reservations with real MongoDB transactions', () => {
     const second = new Types.ObjectId();
     await products.create({ _id: second, hub, name: 'Beans', current_stock: 1, unit_of_measure: 'Units', base_selling_price: 100 });
     await db.transaction(async () => { await logs.create({ item: second, type: 'PURCHASE', quantity: 1, unit_price: 100, batch_number: 'B1', date: new Date() }); });
-    const request = payload('multi', 2); request.lines.push({ productId: String(second), batchNumber: 'B1', saleUnit: 'Units', qty: 2 });
+    const request = payload('multi', 2); request.lines.push({ productId: String(second), saleUnit: 'Units', qty: 2 });
     await expect(service.start(actor, request)).rejects.toThrow();
     expect((await products.findById(product)).reserved_stock).toBe(0);
     expect(await transfers.countDocuments()).toBe(0);
@@ -84,7 +84,7 @@ describe('payment reservations with real MongoDB transactions', () => {
     });
     const request = payload('carton', 1); request.lines[0].saleUnit = 'Carton';
     await service.start(actor, request);
-    expect((await products.findById(product)).reserved_stock).toBe(5);
+    expect((await products.findById(product)).reserved_stock).toBe(1);
   });
   it('blocks CRM stock reductions and reserved-batch consumption on another connection', async () => {
     await service.start(actor, payload('crm', 8));
@@ -174,5 +174,28 @@ describe('payment reservations with real MongoDB transactions', () => {
     await service.start(actor, payload('demoted'));
     await users.updateOne({ _id: manager }, { $set: { role: cashierRole } });
     await expect(service.confirmReceived({ ...actor, sub: String(manager), role: 'manager' }, 'demoted')).rejects.toThrow(/currently assigned/);
+  });
+  it('prices every batch from the SKU and reserves oldest receipts first', async () => {
+    await db.transaction(async () => {
+      await logs.updateMany({ item: product }, { $set: { quantity: 4, quantity_remaining: 4, date: new Date('2026-01-01'), expiry_date: new Date('2027-01-01'), unit_price: 1 } });
+      await logs.create({ item: product, type: 'PURCHASE', quantity: 6, quantity_remaining: 6, batch_number: 'B2', date: new Date('2026-02-01'), expiry_date: new Date('2026-03-01'), unit_price: 999, unit_cost: 80 });
+      await products.updateOne({ _id: product }, { $set: { base_selling_price: 150 } });
+    });
+    const payment = await service.start(actor, payload('fifo', 7));
+    expect(payment.cartTotalKobo).toBe(105000);
+    const held = await transfers.findOne({ client_sale_id: 'fifo' });
+    expect(held.priced_snapshot.lines.map(line => [line.batchNumber, line.stockQuantity])).toEqual([['B1', 4], ['B2', 3]]);
+    await service.confirmReceived(actor, 'fifo');
+    expect((await logs.findOne({ item: product, type: 'PURCHASE', batch_number: 'B1' })).quantity_remaining).toBe(0);
+    expect((await logs.findOne({ item: product, type: 'PURCHASE', batch_number: 'B2' })).quantity_remaining).toBe(3);
+    expect((await products.findById(product)).current_stock).toBe(3);
+  });
+  it('keeps a pending payment price while a SKU change reprices new sales', async () => {
+    const old = await service.start(actor, payload('frozen-price'));
+    await db.transaction(async () => { await products.updateOne({ _id: product }, { $set: { base_selling_price: 200 } }); });
+    const next = await service.start(actor, payload('new-price'));
+    expect(next.cartTotalKobo).toBe(old.cartTotalKobo * 2);
+    await service.confirmReceived(actor, 'frozen-price');
+    expect((await db.model('Sale').findOne({ client_sale_id: 'frozen-price' })).amount).toBe(old.cartTotalKobo / 100);
   });
 });

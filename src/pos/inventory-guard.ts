@@ -68,7 +68,12 @@ export function stockLogInventoryGuard(schema: Schema) {
     const product = await fenceProduct(products, this.item, session);
     if (!product?.reserved_stock) return;
     // Changing historical batch records can invalidate allocations. Use a compensating entry.
-    if (!this.isNew) throw new ConflictException('Cannot edit batch history while stock is reserved.');
+    if (!this.isNew) {
+      if (this.modifiedPaths().every((field: string) => ['quantity_remaining', 'updatedAt', '__v'].includes(field))) {
+        await assertRemainingBalance(this.constructor, this, Number(this.quantity_remaining), product, session); return;
+      }
+      throw new ConflictException('Cannot edit batch history while stock is reserved.');
+    }
     const outbound = this.type === 'SALE' || Number(this.quantity) < 0;
     if (!outbound) return;
     const batch = String(this.batch_number || '').trim();
@@ -86,7 +91,13 @@ export function stockLogInventoryGuard(schema: Schema) {
     const rows = await this.model.find(this.getFilter()).session(session).lean();
     for (const row of rows) {
       const product = await fenceProduct(this.model.db.model('Product'), row.item, session);
-      if (product?.reserved_stock) throw new ConflictException('Cannot rewrite batch history while stock is reserved.');
+      if (product?.reserved_stock) {
+        const update = this.getUpdate() || {};
+        if (rows.length === 1 && this.op === 'updateOne' && Object.keys(update).every(key => ['$set', '$setOnInsert'].includes(key))
+          && Object.keys(update.$set || {}).every(key => ['quantity_remaining', 'updatedAt'].includes(key)) && update.$set?.quantity_remaining != null) {
+          await assertRemainingBalance(this.model, row, Number(update.$set.quantity_remaining), product, session);
+        } else throw new ConflictException('Cannot rewrite batch history while stock is reserved.');
+      }
     }
   });
   schema.pre(['insertMany', 'bulkWrite'] as any, async function(this: any, _operations: any, options: any) {
@@ -110,7 +121,7 @@ export function batchBalance(logs: any[], target: string): number {
     if (inbound) batches.push({ code, remaining: quantity, date: new Date(log.date || 0).getTime(), expiry: log.expiry_date ? new Date(log.expiry_date).getTime() : Infinity });
     else if (outbound) {
       let left = quantity;
-      for (const b of [...batches].sort((a, b) => a.expiry - b.expiry || a.date - b.date)) {
+      for (const b of [...batches].sort((a, b) => a.date - b.date)) {
         if (code && b.code !== code) continue;
         const used = Math.min(left, b.remaining); b.remaining -= used; left -= used;
         if (left <= 0) break;
@@ -118,4 +129,12 @@ export function batchBalance(logs: any[], target: string): number {
     }
   }
   return batches.filter(b => b.code === target).reduce((sum, b) => sum + b.remaining, 0);
+}
+
+async function assertRemainingBalance(model: any, row: any, next: number, product: any, session: any) {
+  if (!Number.isFinite(next) || next < 0) throw new ConflictException('Invalid batch balance');
+  const others = await model.find({ item: row.item, batch_number: row.batch_number, _id: { $ne: row._id }, quantity_remaining: { $exists: true } }).session(session).lean();
+  const total = next + others.reduce((sum: number, log: any) => sum + Number(log.quantity_remaining || 0), 0);
+  const held = Number(product.reserved_batches?.[Buffer.from(String(row.batch_number || '')).toString('hex')] || 0);
+  if (total + 1e-8 < held) throw new ConflictException('Cannot consume stock held for an unresolved payment');
 }

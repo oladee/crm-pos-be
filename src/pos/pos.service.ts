@@ -1,3 +1,4 @@
+import { allocateFifo } from './fifo';
 import { fenceProduct } from './inventory-guard';
 import {
   BadRequestException,
@@ -487,7 +488,9 @@ export class PosService {
         sku: p.sku,
         name: p.name,
         category: p.category || 'Other',
-        price: prices.length ? Math.min(...prices) : nairaToKobo(p.base_selling_price || 0),
+        price: nairaToKobo(p.base_selling_price || 0),
+        cartonPrice: nairaToKobo(p.carton_price || 0),
+        cartonWeight: Number(p.carton_weight) || 0,
         cost: nairaToKobo(p.avg_unit_cost || 0),
         unit: p.unit_of_measure || 'Units',
         stock: Math.max(0, (p.current_stock ?? 0) - (p.reserved_stock ?? 0)),
@@ -554,12 +557,13 @@ export class PosService {
   private async computeRemainingBatches(productId: Types.ObjectId) {
     const logs = await this.stockLogModel
       .find({ item: productId })
-      .sort({ date: 1, createdAt: 1 })
+      .sort({ date: 1, createdAt: 1, _id: 1 })
       .lean();
     type Batch = {
       batchNumber: string;
       date: Date;
       expiryDate?: Date;
+      createdAt?: Date;
       quantityRemaining: number;
       unitCost: number;
       unitPrice: number;
@@ -588,6 +592,7 @@ export class PosService {
           batches.push({
             batchNumber: code,
             date: log.date ? new Date(log.date) : new Date(),
+            createdAt: log.createdAt,
             expiryDate: log.expiry_date ? new Date(log.expiry_date) : undefined,
             quantityRemaining: qty,
             unitCost: Number(log.unit_cost) || 0,
@@ -600,9 +605,6 @@ export class PosService {
         let toDeduct = qty;
         const target = normalizeBatchNumber(log.batch_number);
         const ordered = [...batches].sort((a, b) => {
-          if (a.expiryDate && b.expiryDate) return a.expiryDate.getTime() - b.expiryDate.getTime();
-          if (a.expiryDate) return -1;
-          if (b.expiryDate) return 1;
           return a.date.getTime() - b.date.getTime();
         });
         const pool = target ? ordered.filter((b) => b.batchNumber === target) : ordered;
@@ -616,9 +618,6 @@ export class PosService {
       }
     }
     return batches.filter((b) => b.quantityRemaining > 0).sort((a, b) => {
-      if (a.expiryDate && b.expiryDate) return a.expiryDate.getTime() - b.expiryDate.getTime();
-      if (a.expiryDate) return -1;
-      if (b.expiryDate) return 1;
       return a.date.getTime() - b.date.getTime();
     });
   }
@@ -633,6 +632,7 @@ export class PosService {
       cartonWeight: number;
       unitCost: number;
       date: Date;
+      createdAt?: Date;
     }>();
     for (const row of rows) {
       if (row.batchNumber.startsWith('UNLABELED-')) continue;
@@ -652,10 +652,12 @@ export class PosService {
     }
     return [...grouped.values()].map((batch) => ({
       batchNumber: batch.batchNumber,
+      date: batch.date,
+      createdAt: batch.createdAt,
       quantityRemaining: Math.max(0, batch.quantityRemaining - Number(product.reserved_batches?.[Buffer.from(batch.batchNumber).toString('hex')] || 0)),
-      unitPrice: nairaToKobo(batch.unitPrice || product.base_selling_price || 0),
-      cartonPrice: nairaToKobo(batch.cartonPrice || product.carton_price || 0),
-      cartonWeight: batch.cartonWeight || Number(product.carton_weight) || 0,
+      unitPrice: nairaToKobo(product.base_selling_price || 0),
+      cartonPrice: nairaToKobo(product.carton_price || 0),
+      cartonWeight: Number(product.carton_weight) || 0,
       unitCost: nairaToKobo(batch.unitCost || product.avg_unit_cost || 0),
     }));
   }
@@ -676,6 +678,8 @@ export class PosService {
     }> = [];
     let subtotal = 0;
     let lineDiscount = 0;
+    const usedStock = new Map<string, number>();
+    const usedByBatch = new Map<string, Record<string, number>>();
     for (const line of lines) {
       const productId = String(line.productId || line.product || '');
       if (!Types.ObjectId.isValid(productId)) throw new BadRequestException('Each line needs a product');
@@ -683,11 +687,7 @@ export class PosService {
       if (!product || String(product.hub) !== hubId) {
         throw new ForbiddenException('A product on this sale is not stocked at this location');
       }
-      const batchNumber = normalizeBatchNumber(line.batchNumber || line.batch_number);
-      if (!batchNumber) throw new BadRequestException(`Select a batch for ${product.name}`);
       const batches = await this.openBatches(product);
-      const batch = batches.find((b) => b.batchNumber === batchNumber);
-      if (!batch) throw new BadRequestException(`Batch ${batchNumber} is not open for ${product.name}`);
       const carton = isCartonUnit(product.unit_of_measure);
       const saleUnit = carton
         ? (line.saleUnit || line.sale_unit || '')
@@ -695,24 +695,28 @@ export class PosService {
       if (carton && saleUnit !== 'Carton' && saleUnit !== 'Kg') {
         throw new BadRequestException(`Select Carton or Kg for ${product.name}`);
       }
-      const unitPriceKobo = saleUnit === 'Carton' ? batch.cartonPrice : batch.unitPrice;
+      const unitPriceKobo = nairaToKobo(saleUnit === 'Carton' ? product.carton_price || 0 : product.base_selling_price || 0);
       if (!unitPriceKobo) {
-        throw new BadRequestException(`Batch ${batchNumber} has no selling price for ${product.name}`);
+        throw new BadRequestException(`Set the SKU selling price for ${product.name}`);
       }
       const qty = this.lineQty(line);
       if (qty <= 0) throw new BadRequestException(`Quantity is required for ${product.name}`);
       let stockQuantity = qty;
-      if (saleUnit === 'Carton') {
-        if (!(batch.cartonWeight > 0)) {
-          throw new BadRequestException(`Set the carton weight on batch ${batchNumber} before selling it`);
-        }
-        stockQuantity = qty * batch.cartonWeight;
+      if (carton && saleUnit === 'Kg') {
+        if (!(Number(product.carton_weight) > 0)) throw new BadRequestException('Set the SKU carton weight before selling by Kg');
+        stockQuantity = qty / Number(product.carton_weight);
       }
-      if (batch.quantityRemaining < stockQuantity) {
-        throw new BadRequestException(
-          `Batch ${batchNumber} has ${batch.quantityRemaining} left for ${product.name}`,
-        );
-      }
+      const already = usedStock.get(String(product._id)) || 0;
+      if (Number(product.current_stock || 0) - Number(product.reserved_stock || 0) - already + 1e-9 < stockQuantity) throw new BadRequestException('Insufficient available stock for ' + product.name);
+      const usedBatches = usedByBatch.get(String(product._id)) || {};
+      let allocations;
+      try {
+        allocations = allocateFifo(batches.map(batch => ({ id: batch.batchNumber, batchNumber: batch.batchNumber, date: batch.date, createdAt: batch.createdAt,
+          quantityRemaining: Math.max(0, batch.quantityRemaining - (usedBatches[batch.batchNumber] || 0)), unitCost: batch.unitCost })), stockQuantity);
+      } catch { throw new BadRequestException('Insufficient available FIFO stock for ' + product.name); }
+      usedStock.set(String(product._id), already + stockQuantity);
+      for (const allocation of allocations) usedBatches[allocation.batch_number] = (usedBatches[allocation.batch_number] || 0) + allocation.quantity;
+      usedByBatch.set(String(product._id), usedBatches);
       const gross = unitPriceKobo * qty;
       const discountKobo = Math.max(0, Math.round(Number(line.discount) || 0));
       const cap = Math.round(gross * (POS_MAX_DISCOUNT_PCT / 100));
@@ -721,17 +725,14 @@ export class PosService {
       }
       subtotal += gross;
       lineDiscount += discountKobo;
-      priced.push({
-        product,
-        batchNumber,
-        saleUnit,
-        quantity: qty,
-        stockQuantity,
-        unitPriceKobo,
-        unitCostKobo: batch.unitCost,
-        discountKobo,
-        name: product.name,
-      });
+      let assignedDiscount = 0;
+      for (let index = 0; index < allocations.length; index++) {
+        const allocation = allocations[index];
+        const allocatedDiscount = index === allocations.length - 1 ? discountKobo - assignedDiscount : Math.round(discountKobo * allocation.quantity / stockQuantity);
+        assignedDiscount += allocatedDiscount;
+        priced.push({ product, batchNumber: allocation.batch_number, saleUnit, quantity: qty * allocation.quantity / stockQuantity,
+          stockQuantity: allocation.quantity, unitPriceKobo, unitCostKobo: allocation.unit_cost, discountKobo: allocatedDiscount, name: product.name });
+      }
     }
     const afterLines = subtotal - lineDiscount;
     const orderDiscount = Math.max(0, Math.round(Number(payload.orderDiscount) || 0));
@@ -815,6 +816,7 @@ export class PosService {
       batchNumber: batch,
       notes: 'POS sale',
     });
+    await this.syncSavedBatchBalances(product._id, batch);
     const fresh = await this.productModel.findById(product._id);
     const next = (Number(fresh?.current_stock) || 0) - qty;
     if (next < 0) throw new BadRequestException('Not enough available stock');
@@ -822,6 +824,18 @@ export class PosService {
       { _id: product._id },
       { $set: { current_stock: next, last_stock_update: new Date() } },
     );
+  }
+
+  private async syncSavedBatchBalances(productId: Types.ObjectId, batchNumber: string) {
+    const replay = await this.computeRemainingBatches(productId);
+    let remaining = replay.filter(row => row.batchNumber === batchNumber).reduce((sum, row) => sum + row.quantityRemaining, 0);
+    const rows = await this.stockLogModel.find({ item: productId, batch_number: batchNumber, quantity: { $gt: 0 }, type: { $in: ['PURCHASE', 'RETURN', 'TRANSFER', 'ADJUSTMENT'] } }).sort({ date: 1, createdAt: 1, _id: 1 });
+    // Assign the remaining balance to the newest receipt first: the oldest was consumed first.
+    for (const row of [...rows].reverse()) {
+      const next = Math.min(Math.max(0, Number(row.quantity) || 0), remaining);
+      remaining -= next;
+      await this.stockLogModel.updateOne({ _id: row._id }, { $set: { quantity_remaining: next } });
+    }
   }
 
   private async restoreProductStock(
@@ -843,6 +857,7 @@ export class PosService {
       batchNumber,
       notes: 'POS reversal',
     });
+    if (batchNumber) await this.syncSavedBatchBalances(product._id, batchNumber);
     const next = (Number(product.current_stock) || 0) + Math.abs(qty);
     await this.productModel.updateOne(
       { _id: product._id },

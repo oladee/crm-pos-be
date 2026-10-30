@@ -122,6 +122,7 @@ export const CustomerSchema = new Schema(
 
 export const StockLogSchema = new Schema(
   {
+    quantity_remaining: Number,
     item: { type: Schema.Types.ObjectId, ref: 'Product' },
     item_name: String,
     type: String,
