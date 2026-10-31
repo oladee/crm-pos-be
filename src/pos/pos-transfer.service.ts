@@ -62,7 +62,8 @@ export class PosTransferService {
       expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null, sale: row.sale_payload,
       reservationState: row.reservation_state || 'needs_review', reconciliationReason: row.reconciliation_reason || null,
       canConfirmReceived: Boolean(user && unresolved && row.reservation_state === 'held' && row.checkout_id && hub?.pos_manual_payment_confirmation === true && (user.role === 'manager' || String(row.cashier) === user.sub)),
-      canCancel: Boolean(user && unresolved), confirmationSource: row.confirmation_source || null };
+      canCancel: Boolean(user && unresolved), confirmationSource: row.confirmation_source || null,
+      confirmedAt: row.confirmed_at ? new Date(row.confirmed_at).toISOString() : null };
   }
 
   private validEmail(value: unknown) {
@@ -186,11 +187,17 @@ export class PosTransferService {
     return row;
   }
 
-  async list(user: PosJwtPayload, _deviceId?: string) {
+  async list(user: PosJwtPayload, _deviceId?: string, includePaid = false) {
     await this.scope(user, { hub: user.hubId, cashier: user.sub });
     const filter: any = { hub: user.hubId, status: { $in: UNRESOLVED } };
     if (user.role !== 'manager') filter.cashier = user.sub;
     else { delete filter.status; filter.$or = [{ status: { $in: UNRESOLVED } }, { status: 'cancelled', 'reconciliation_events.0': { $exists: true } }]; }
+    // Receipt recovery is limited to the authenticated till, never a caller-supplied device.
+    if (includePaid && user.deviceId) {
+      const pending = filter.$or || [{ status: filter.status }];
+      delete filter.status;
+      filter.$or = [...pending, { status: 'paid', device_id: user.deviceId }];
+    }
     const rows = await this.transfers.find(filter).sort({ createdAt: -1 });
     return { data: await Promise.all(rows.map(row => this.view(row, user))) };
   }

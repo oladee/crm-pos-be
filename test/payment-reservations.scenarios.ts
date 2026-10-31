@@ -104,6 +104,11 @@ describe('payment reservations with real MongoDB transactions', () => {
     const current = await products.findById(product);
     expect(current.current_stock).toBe(8); expect(current.reserved_stock).toBe(0);
     expect((await transfers.findOne({ client_sale_id: 'complete' })).reservation_state).toBe('consumed');
+    const receipt = await service.status(actor, 'complete', false);
+    expect(receipt.confirmedAt).toBe((await transfers.findOne({ client_sale_id: 'complete' })).confirmed_at.toISOString());
+    expect((await service.list(actor)).data.some(row => row.clientSaleId === 'complete')).toBe(false);
+    expect((await service.list(actor, undefined, true)).data.some(row => row.clientSaleId === 'complete')).toBe(true);
+    expect((await service.list({ ...actor, deviceId: 'another-till' }, undefined, true)).data.some(row => row.clientSaleId === 'complete')).toBe(false);
   });
   it('keeps expired stock held, then releases exactly once on cancellation', async () => {
     await service.start(actor, payload('expiry'));

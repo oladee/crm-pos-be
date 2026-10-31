@@ -151,8 +151,8 @@ export class PosController {
 
   @UseGuards(PosJwtGuard)
   @Get('payments/transfers')
-  listTransfers(@PosUser() user: PosJwtPayload, @Query('deviceId') deviceId?: string) {
-    return this.transfers.list(user, deviceId);
+  listTransfers(@PosUser() user: PosJwtPayload, @Query('deviceId') deviceId?: string, @Query('includePaid') includePaid?: string) {
+    return this.transfers.list(user, deviceId, includePaid === 'true');
   }
 
   @UseGuards(PosJwtGuard)
