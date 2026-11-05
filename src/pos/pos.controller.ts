@@ -6,6 +6,7 @@ import { PosJwtGuard, PosUser, type PosJwtPayload } from './pos-auth';
 import { PosService } from './pos.service';
 import { PosPasskeyService } from './pos-passkey.service';
 import { PosTransferService } from './pos-transfer.service';
+import { CheckoutService } from './checkout.service';
 
 @Controller('pos')
 export class PosController {
@@ -13,6 +14,7 @@ export class PosController {
     private readonly posService: PosService,
     private readonly passkeys: PosPasskeyService,
     private readonly transfers: PosTransferService,
+    private readonly checkouts: CheckoutService,
   ) {}
 
   @Get('locations')
@@ -126,7 +128,8 @@ export class PosController {
   }
 
   @Post('webhooks/squad')
-  squadWebhook(@Req() req: RawBodyRequest<Request>) {
+  async squadWebhook(@Req() req: RawBodyRequest<Request>) {
+    if (await this.checkouts.receiveSquad(req.rawBody?.toString('utf8') || '', req.headers)) return { received: true };
     return this.transfers.handleWebhook(req.rawBody?.toString('utf8') || '', req.headers, 'squad');
   }
 

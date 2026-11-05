@@ -96,11 +96,14 @@ export const SaleSchema = new Schema(
     payment_type: String,
     payment_mode: { type: String, default: 'Full Payment' },
     amount_paid: { type: Number, default: 0 },
+    due_date: Date,
+    credit_record: { type: Schema.Types.ObjectId, ref: 'CreditRecord', default: null },
     source: { type: String, default: 'pos' },
     client_sale_id: { type: String, sparse: true, unique: true },
     device_id: { type: String, index: true },
     reversal_of: String,
     reversal_kind: String,
+      credit_balance_kobo: Number,
   },
   { collection: 'sales', timestamps: true },
 );
@@ -116,6 +119,8 @@ export const CustomerSchema = new Schema(
     assigned_agent: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     added_by: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     joined_date: { type: Date, default: Date.now },
+    total_orders: { type: Number, default: 0 },
+    total_spent: { type: Number, default: 0 },
   },
   { collection: 'customers', timestamps: true },
 );

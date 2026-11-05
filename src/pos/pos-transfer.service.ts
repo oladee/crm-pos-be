@@ -99,6 +99,7 @@ export class PosTransferService {
     stage = 'existing_payment';
     const existing = await this.transfers.findOne({ client_sale_id: clientSaleId });
     if (existing) { await this.scope(user, existing); return this.view(existing, user); }
+    if (process.env.POS_CHECKOUT_V2_ENABLED === 'true') throw new ConflictException('Update this till and use the customer checkout flow');
     stage = 'rollout_preflight';
     if (process.env.POS_PAYMENT_RESERVATIONS_ENABLED !== 'true' || !await this.rolloutReady()) throw new ServiceUnavailableException('Reserved payments are not ready. Run the inventory reservation preflight and backfill first.');
     const providerId: PaymentProviderId = payload.provider || 'bachs';

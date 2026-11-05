@@ -869,6 +869,8 @@ export class PosService {
     const m = String(method || 'Cash');
     if (m === 'Transfer') return 'Transfer';
     if (m === 'Card' || m === 'POS') return 'POS';
+    if (m === 'Other') return 'Other';
+    if (m === 'Credit') return undefined;
     return 'Cash';
   }
 
@@ -1044,6 +1046,10 @@ export class PosService {
       return { data: existing, idempotent: true };
     }
 
+    if (!snapshot && process.env.POS_CHECKOUT_V2_ENABLED === 'true') {
+      throw new ConflictException('Update this till and use the customer checkout flow');
+    }
+
     if (!snapshot && await this.productModel.db.model('PosTransfer').exists({ client_sale_id: clientSaleId })) {
       throw new ConflictException('This sale is locked to an existing payment. Confirm or cancel that payment.');
     }
@@ -1140,7 +1146,9 @@ export class PosService {
       if (String(existing.hub) !== hubId || (existing.device_id && existing.device_id !== user.deviceId)) {
         throw new ForbiddenException('Transaction belongs to another location or till');
       }
-      return { data: existing, idempotent: true };
+      return { data: existing, idempotent: true,
+        creditBalanceKobo: (existing as any).credit_balance_kobo,
+        refundPaidKobo: (existing as any).credit_balance_kobo == null ? undefined : Math.round(Math.abs(existing.amount_paid || 0) * 100) };
     }
 
     const original = await this.saleModel.findOne({ client_sale_id: originalClientId });
@@ -1172,6 +1180,26 @@ export class PosService {
       : -Math.abs(original.amount);
     const firstPay = (payload.payments || [])[0];
 
+    let creditBalanceKobo: number | undefined, refundPaidKobo: number | undefined;
+    if ((original as any).credit_record) {
+      const credits = this.productModel.db.model('CreditRecord');
+      const credit = await credits.findOneAndUpdate({ _id: (original as any).credit_record }, { $inc: { __v: 1 } }, { new: true });
+      if (!credit || credit.status === 'Voided') throw new ConflictException('Credit needs reconciliation in CRM');
+      const previous = await this.saleModel.find({ reversal_of: originalClientId }).lean();
+      const netKobo = Math.round((original.amount + previous.reduce((sum, sale) => sum + sale.amount, 0) - Math.abs(amount)) * 100);
+      if (netKobo < 0) throw new BadRequestException('Refund exceeds the remaining sale value');
+      const paidBefore = Math.round(((original as any).amount_paid || 0) * 100);
+      const repaid = Math.round((credit.original_amount - credit.amount_owed) * 100);
+      const newOriginal = Math.max(0, netKobo - paidBefore);
+      if (newOriginal < repaid) throw new ConflictException('Refund affects recorded credit repayments; reconcile this refund in CRM first');
+      creditBalanceKobo = newOriginal - repaid;
+      const debtReduction = Math.round(credit.amount_owed * 100) - creditBalanceKobo;
+      refundPaidKobo = Math.round(Math.abs(amount) * 100) - debtReduction;
+      credit.original_amount = newOriginal / 100; credit.amount_owed = creditBalanceKobo / 100;
+      credit.status = kind === 'void' ? 'Voided' : creditBalanceKobo === 0 ? 'Clear' : new Date(credit.due_date).getTime() < Date.now() ? 'Overdue' : 'Pending';
+      await credit.save();
+    }
+
     if (kind === 'void') {
       original.status = 'Voided';
       await original.save();
@@ -1194,12 +1222,13 @@ export class PosService {
       channel: 'POS',
       payment_type: this.paymentType(firstPay?.method),
       payment_mode: 'Full Payment',
-      amount_paid: amount,
+      amount_paid: refundPaidKobo == null ? amount : -refundPaidKobo / 100,
       device_id: user.deviceId,
       source: 'pos',
       client_sale_id: reversalId,
       reversal_of: originalClientId,
       reversal_kind: kind,
+      credit_balance_kobo: creditBalanceKobo,
     });
 
     for (const line of mappedItems) {
@@ -1216,7 +1245,7 @@ export class PosService {
       );
     }
 
-    return { data: created };
+    return { data: created, creditBalanceKobo, refundPaidKobo };
   }
 
   refundSale(user: PosJwtPayload, clientSaleId: string, payload: Record<string, any>) {

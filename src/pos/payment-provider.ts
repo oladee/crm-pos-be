@@ -14,6 +14,7 @@ export type PaymentEvidence = {
   status: 'paid' | 'expired' | 'awaiting' | 'review';
   amountKobo?: number;
   currency?: string;
+  transactionReference?: string;
 };
 export const TRANSFER_START_REJECTED = 'This bank transfer could not be started. Try again or use another payment method.';
 export const TRANSFER_INSTRUCTIONS_MISSING = 'Bank account details were not returned. Try again or use another payment method.';

@@ -48,6 +48,7 @@ export class SquadClient implements PaymentProvider {
     if (success) {
       // Some DVA query responses omit amount/currency. Never infer receipt from status alone.
       return { reference, eventId: `poll:${reference}`, status: 'paid',
+        transactionReference: typeof success.transaction_reference === 'string' && success.transaction_reference !== reference ? success.transaction_reference : undefined,
         amountKobo: success.amount_received == null ? undefined : nairaToKobo(success.amount_received),
         currency: success.currency };
     }

@@ -7,6 +7,9 @@ import { PosService } from './pos.service';
 import { PosPasskeyService } from './pos-passkey.service';
 import { PosTransferService } from './pos-transfer.service';
 import { PosJwtGuard } from './pos-auth';
+import { CheckoutController } from './checkout.controller';
+import { CheckoutService } from './checkout.service';
+import { CreditRecordSchema, PosCheckoutSchema, PosPaymentAttemptSchema, PosProviderTransactionSchema, PosTerminalLockSchema, PosWebhookInboxSchema } from './schemas/checkout-models';
 import {
   CustomerSchema,
   HubSchema,
@@ -45,6 +48,12 @@ import {
       { name: 'PosEnrollmentCode', schema: PosEnrollmentCodeSchema },
       { name: 'PosWebauthnChallenge', schema: PosWebauthnChallengeSchema },
       { name: 'PosTransfer', schema: PosTransferSchema },
+      { name: 'CreditRecord', schema: CreditRecordSchema },
+      { name: 'PosCheckout', schema: PosCheckoutSchema },
+      { name: 'PosPaymentAttempt', schema: PosPaymentAttemptSchema },
+      { name: 'PosProviderTransaction', schema: PosProviderTransactionSchema },
+      { name: 'PosTerminalLock', schema: PosTerminalLockSchema },
+      { name: 'PosWebhookInbox', schema: PosWebhookInboxSchema },
     ]),
     JwtModule.registerAsync({
       imports: [ConfigModule],
@@ -54,7 +63,7 @@ import {
       }),
     }),
   ],
-  controllers: [PosController],
-  providers: [PosService, PosPasskeyService, PosTransferService, PosJwtGuard],
+  controllers: [PosController, CheckoutController],
+  providers: [PosService, PosPasskeyService, PosTransferService, PosJwtGuard, CheckoutService],
 })
 export class PosModule {}
