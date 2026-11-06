@@ -233,7 +233,7 @@ describe('customer checkout and payment recovery', () => {
     const second = await attempt(await create('recover'));
     requests.get(second.attempts[0].reference).paid = true;
     const { CheckoutService } = require('../dist/pos/checkout.service'), { PosService } = require('../dist/pos/pos.service');
-    const restarted = new CheckoutService(db, app.get(PosService));
+    const restarted = new CheckoutService(db, app.get(PosService), app.get('PSP_AUDIT'));
     await restarted.poll(await db.model('PosPaymentAttempt').findById(second.attempts[0].id));
     assert.equal((await api(`/checkouts/${second.id}`)).data.status, 'completed');
   });
@@ -346,5 +346,97 @@ describe('customer checkout and payment recovery', () => {
     const completed = (await api(`/checkouts/${row.id}`)).data;
     assert.equal(completed.status, 'completed'); assert.equal(completed.receipt.receiptPayment.feeKobo, 100);
     assert.equal((await db.model('Sale').findOne()).amount, 200);
+    const audit = await db.collection('pos_psp_audit').find({ provider_id: 'squad' }).toArray();
+    assert.ok(audit.some(row => row.stage === 'request_intent' && row.location_id === String(hub)));
+    assert.ok(audit.some(row => row.stage === 'webhook_result' && row.verification_result === 'valid'));
+    assert.ok(!JSON.stringify(audit).includes('sandbox_test'));
+  });
+
+  it('audits requests, each webhook retry and rejection without duplicate sales; restricts reads to managers', async () => {
+    const row = await attempt(await create('audit-evidence')), payment = row.attempts[0];
+    const outbound = await db.collection('pos_psp_audit').find({ direction: 'outbound' }).toArray();
+    assert.equal(outbound.length, 2);
+    assert.equal(outbound[0].merchant_reference, payment.reference);
+    assert.equal(outbound[0].provider_id, 'moniepoint'); assert.equal(outbound[0].account_key, 'lagos');
+    assert.equal(outbound[0].amount_kobo, row.dueKobo); assert.equal(outbound[0].location_id, String(hub));
+    assert.equal(outbound[0].exchange_id, outbound[1].exchange_id); assert.equal(outbound[1].http_status, 202);
+    assert.equal((await webhook(payment, {}, false)).status, 400);
+    assert.equal((await webhook(payment)).status, 201); assert.equal((await webhook(payment)).status, 201);
+    await service.tick(); assert.equal(await db.model('Sale').countDocuments(), 1);
+    const inbound = await db.collection('pos_psp_audit').find({ direction: 'inbound' }).toArray();
+    assert.equal(inbound.filter(row => row.stage === 'webhook_received').length, 3);
+    assert.equal(inbound.filter(row => row.stage === 'webhook_result' && row.verification_result === 'valid').length, 2);
+    assert.ok(inbound.some(row => row.verification_result === 'invalid_signature_or_business' && !row.location_id));
+    const serialized = JSON.stringify([...outbound, ...inbound]);
+    assert.ok(!serialized.includes('test-webhook-secret')); assert.ok(!serialized.includes('test-key'));
+    assert.equal((await api('/payment-audit')).status, 403);
+    await app.get('PSP_AUDIT').append({ exchange_id: 'foreign', provider_id: 'squad', location_id: String(new Types.ObjectId()), stage: 'test' });
+    const page = await api('/payment-audit', undefined, managerToken);
+    assert.equal(page.status, 200); assert.ok(page.data.data.length > 0);
+    assert.ok(page.data.data.every(item => item.location_id === String(hub)));
+    assert.equal((await api('/payment-audit?provider=invalid', undefined, managerToken)).status, 400);
+    const indexes = await db.collection('pos_psp_audit').indexes();
+    assert.ok(indexes.every(index => index.expireAfterSeconds === undefined));
+    await assert.rejects(db.model('PspAudit').updateOne({}, { $set: { stage: 'modified' } }), /append-only/);
+  });
+
+  it('keeps audit writes outside payment transaction rollback and records parser rejections', async () => {
+    await assert.rejects(db.transaction(async () => {
+      await app.get('PSP_AUDIT').append({ exchange_id: 'rollback-proof', provider_id: 'moniepoint', stage: 'test' });
+      throw new Error('force rollback');
+    }), /force rollback/);
+    assert.ok(await db.collection('pos_psp_audit').findOne({ exchange_id: 'rollback-proof' }));
+    const raw = '{"broken":';
+    const response = await fetch(base + '/pos/webhooks/moniepoint/lagos', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: raw });
+    assert.equal(response.status, 400);
+    const rejected = await db.collection('pos_psp_audit').findOne({ outcome: 'parser_rejected' });
+    assert.ok(rejected); assert.equal(rejected.body_sha256, crypto.createHash('sha256').update(raw).digest('hex'));
+    assert.equal(rejected.payload_format, 'non_json');
+  });
+
+  it('prevents unaudited provider requests and keeps an uncertain response locked', async () => {
+    const audit = app.get('PSP_AUDIT'), append = audit.append.bind(audit);
+    audit.append = async () => { throw new Error('storage unavailable'); };
+    try {
+      const row = await attempt(await create('audit-offline'));
+      assert.equal(pushCalls, 0); assert.equal(row.attempts[0].status, 'failed');
+      assert.equal(await db.model('PosTerminalLock').countDocuments(), 0);
+    } finally { audit.append = append; }
+    audit.append = async record => { if (record.stage === 'http_response') throw new Error('storage unavailable'); return append(record); };
+    try {
+      const row = await attempt(await create('audit-result-offline'));
+      assert.equal(pushCalls, 1); assert.equal(row.attempts[0].status, 'unknown');
+      assert.equal(await db.model('PosTerminalLock').countDocuments(), 1);
+      assert.equal(await db.model('Sale').countDocuments(), 0);
+    } finally { audit.append = append; }
+  });
+
+  it('does not acknowledge an unaudited webhook and safely accepts its later retry', async () => {
+    const row = await attempt(await create('webhook-audit-offline')), payment = row.attempts[0];
+    const audit = app.get('PSP_AUDIT'), append = audit.append.bind(audit);
+    audit.append = async record => { if (record.stage === 'webhook_received') throw new Error('storage offline'); return append(record); };
+    try { assert.equal((await webhook(payment)).status, 503); assert.equal(await db.model('PosWebhookInbox').countDocuments(), 0); }
+    finally { audit.append = append; }
+    audit.append = async record => { if (record.stage === 'webhook_result') throw new Error('storage offline'); return append(record); };
+    try { assert.equal((await webhook(payment)).status, 503); assert.equal(await db.model('PosWebhookInbox').countDocuments(), 1); }
+    finally { audit.append = append; }
+    assert.equal((await webhook(payment)).status, 201); await service.tick();
+    assert.equal(await db.model('Sale').countDocuments(), 1);
+  });
+
+  it('retains verified historical Bachs deliveries with their provider and exact body hash', async () => {
+    process.env.BACHS_API_KEY = 'sk_sandbox_audit'; process.env.BACHS_WEBHOOK_SECRET = 'bachs-audit-secret';
+    try {
+      const raw = JSON.stringify({ id: 'legacy-event', type: 'collection.succeeded', data: { checkout_id: 'unknown-legacy', amount: '100.00', currency: 'NGN', status: 'paid' } });
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const signature = crypto.createHmac('sha256', 'bachs-audit-secret').update(`${timestamp}.${raw}`).digest('hex');
+      const response = await fetch(base + '/pos/webhooks/bachs', { method: 'POST', body: raw,
+        headers: { 'Content-Type': 'application/json', 'x-bachs-timestamp': timestamp, 'x-bachs-signature': signature } });
+      assert.equal(response.status, 201);
+      const record = await db.collection('pos_psp_audit').findOne({ provider_id: 'bachs', stage: 'webhook_result' });
+      assert.equal(record.verification_result, 'valid'); assert.equal(record.merchant_reference, 'unknown-legacy');
+      assert.equal(record.body_sha256, crypto.createHash('sha256').update(raw).digest('hex'));
+      assert.equal(await db.model('Sale').countDocuments(), 0);
+    } finally { delete process.env.BACHS_API_KEY; delete process.env.BACHS_WEBHOOK_SECRET; }
   });
 });

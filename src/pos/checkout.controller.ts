@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Inject, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
+import type { PspAuditService } from './psp-audit.service';
 import type { RawBodyRequest } from '@nestjs/common';
 import type { Request } from 'express';
 import { CheckoutService } from './checkout.service';
@@ -6,11 +7,12 @@ import { PosJwtGuard, type PosJwtPayload, PosUser } from './pos-auth';
 
 @Controller('pos')
 export class CheckoutController {
-  constructor(private readonly checkouts: CheckoutService) {}
+  constructor(private readonly checkouts: CheckoutService, @Inject('PSP_AUDIT') private readonly audit: PspAuditService) {}
 
   @Post('webhooks/moniepoint/:accountKey')
   moniepoint(@Param('accountKey') key: string, @Req() req: RawBodyRequest<Request>) {
-    return this.checkouts.receiveMoniepoint(key, req.rawBody?.toString('utf8') || '', req.headers);
+    const raw = req.rawBody?.toString('utf8') || '';
+    return this.audit.webhook('moniepoint', key, req.rawBody || raw, req.headers, trace => this.checkouts.receiveMoniepoint(key, raw, req.headers, trace));
   }
 
   @Get('checkouts/options') @UseGuards(PosJwtGuard)

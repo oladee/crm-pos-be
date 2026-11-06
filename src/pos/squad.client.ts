@@ -1,23 +1,24 @@
 import { createHmac, timingSafeEqual } from 'crypto';
 import { PaymentEvidence, PaymentProvider, ProviderFailure, TRANSFER_STAFF_EMAIL_REQUIRED, TransferInstructions } from './payment-provider';
 import { nairaToKobo } from './bachs.client';
+import { auditedPspFetch, type AuditHttp } from './psp-audit';
 
 // DVA v2 contract: https://squadinc.gitbook.io/virtual-accounts/reference/dynamic-virtual-account-v2
 // Activation requires explicit merchant profiling and contract verification.
 export class SquadClient implements PaymentProvider {
   constructor(private readonly key: string, private readonly baseUrl = key.startsWith('sandbox_')
-    ? 'https://sandbox-api-d.squadco.com' : 'https://api-d.squadco.com') {}
+    ? 'https://sandbox-api-d.squadco.com' : 'https://api-d.squadco.com', private readonly audit?: AuditHttp) {}
 
   private async request(path: string, body?: unknown): Promise<any> {
     let response: Response;
     try {
-      response = await fetch(`${this.baseUrl}${path}`, {
+      response = await auditedPspFetch(`${this.baseUrl}${path}`, {
         method: body ? 'POST' : 'GET',
         headers: { Authorization: `Bearer ${this.key}`, 'Content-Type': 'application/json' },
         body: body ? JSON.stringify(body) : undefined,
         signal: AbortSignal.timeout(20_000),
-      });
-    } catch { throw new ProviderFailure('Squad response is unknown. Stock remains held; check this payment before trying again.', false); }
+      }, this.audit);
+    } catch (error) { if (error instanceof ProviderFailure) throw error; throw new ProviderFailure('Squad response is unknown. Stock remains held; check this payment before trying again.', false); }
     const result = await response.json().catch(() => null);
     if (!response.ok || !result?.success) {
       // Timeouts, server errors and duplicate-reference responses do not prove failure.

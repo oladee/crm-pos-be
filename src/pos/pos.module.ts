@@ -11,6 +11,11 @@ import { CheckoutController } from './checkout.controller';
 import { CheckoutService } from './checkout.service';
 import { TransactionsService } from './transactions.service';
 import { TransactionsController } from './transactions.controller';
+import { PspAuditService } from './psp-audit.service';
+import { PspAuditSchema } from './schemas/psp-audit';
+import { PaymentAuditController } from './payment-audit.controller';
+import { APP_FILTER } from '@nestjs/core';
+import { PaymentAuditFilter } from './payment-audit.filter';
 import { CreditRecordSchema, PosCheckoutSchema, PosPaymentAttemptSchema, PosProviderTransactionSchema, PosTerminalLockSchema, PosWebhookInboxSchema } from './schemas/checkout-models';
 import {
   CustomerSchema,
@@ -56,6 +61,7 @@ import {
       { name: 'PosProviderTransaction', schema: PosProviderTransactionSchema },
       { name: 'PosTerminalLock', schema: PosTerminalLockSchema },
       { name: 'PosWebhookInbox', schema: PosWebhookInboxSchema },
+      { name: 'PspAudit', schema: PspAuditSchema },
     ]),
     JwtModule.registerAsync({
       imports: [ConfigModule],
@@ -65,7 +71,8 @@ import {
       }),
     }),
   ],
-  controllers: [PosController, CheckoutController, TransactionsController],
-  providers: [PosService, PosPasskeyService, PosTransferService, PosJwtGuard, CheckoutService, TransactionsService],
+  controllers: [PosController, CheckoutController, TransactionsController, PaymentAuditController],
+  providers: [PosService, PosPasskeyService, PosTransferService, PosJwtGuard, CheckoutService, TransactionsService,
+    PspAuditService, { provide: 'PSP_AUDIT', useExisting: PspAuditService }, { provide: APP_FILTER, useClass: PaymentAuditFilter }],
 })
 export class PosModule {}

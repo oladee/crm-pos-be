@@ -1,6 +1,7 @@
 import { Logger, ServiceUnavailableException } from '@nestjs/common';
 import { paymentLogError, paymentLogText, paymentLogValidationFields } from './payment-log';
 import { ProviderFailure, TRANSFER_INSTRUCTIONS_MISSING, TRANSFER_STAFF_EMAIL_REQUIRED, TRANSFER_START_REJECTED } from './payment-provider';
+import { auditedPspFetch, type AuditHttp } from './psp-audit';
 
 export type BachsInstructions = {
   checkoutId: string;
@@ -86,7 +87,7 @@ export function isPaidStatus(status: string) {
 
 export class BachsClient {
   private readonly logger = new Logger(BachsClient.name);
-  constructor(private readonly apiKey: string, private readonly origin = bachsBaseUrl(apiKey)) {}
+  constructor(private readonly apiKey: string, private readonly origin = bachsBaseUrl(apiKey), private readonly audit?: AuditHttp) {}
 
   private async request(method: string, path: string, body?: Json, idempotencyKey?: string) {
     const started = Date.now();
@@ -107,13 +108,14 @@ export class BachsClient {
     if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
     let res: Response;
     try {
-      res = await fetch(`${this.origin}${path}`, {
+      res = await auditedPspFetch(`${this.origin}${path}`, {
         method,
         headers,
         body: body ? JSON.stringify(body) : undefined,
         signal: AbortSignal.timeout(20_000),
-      });
+      }, this.audit);
     } catch (error) {
+      if (error instanceof ProviderFailure) throw error;
       this.logger.warn({ event: 'bachs.network_failed', ...context, elapsedMs: Date.now() - started,
         errorType: error instanceof Error ? error.name : 'UnknownError' });
       throw new ProviderFailure(TRANSFER_START_REJECTED, false);

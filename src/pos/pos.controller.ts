@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Inject, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
+import type { PspAuditService } from './psp-audit.service';
 import type { RawBodyRequest } from '@nestjs/common';
 import type { Request } from 'express';
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from '@simplewebauthn/server';
@@ -15,6 +16,7 @@ export class PosController {
     private readonly passkeys: PosPasskeyService,
     private readonly transfers: PosTransferService,
     private readonly checkouts: CheckoutService,
+    @Inject('PSP_AUDIT') private readonly audit: PspAuditService,
   ) {}
 
   @Get('locations')
@@ -129,8 +131,11 @@ export class PosController {
 
   @Post('webhooks/squad')
   async squadWebhook(@Req() req: RawBodyRequest<Request>) {
-    if (await this.checkouts.receiveSquad(req.rawBody?.toString('utf8') || '', req.headers)) return { received: true };
-    return this.transfers.handleWebhook(req.rawBody?.toString('utf8') || '', req.headers, 'squad');
+    const raw = req.rawBody?.toString('utf8') || '';
+    return this.audit.webhook('squad', 'squad', req.rawBody || raw, req.headers, async trace => {
+      if (await this.checkouts.receiveSquad(raw, req.headers, trace)) return { received: true };
+      return this.transfers.handleWebhook(raw, req.headers, 'squad', trace);
+    });
   }
 
   @UseGuards(PosJwtGuard)
@@ -143,7 +148,8 @@ export class PosController {
 
   @Post('webhooks/bachs')
   bachsWebhook(@Req() req: RawBodyRequest<Request>) {
-    return this.transfers.handleWebhook(req.rawBody?.toString('utf8') || '', req.headers);
+    const raw = req.rawBody?.toString('utf8') || '';
+    return this.audit.webhook('bachs', 'bachs', req.rawBody || raw, req.headers, trace => this.transfers.handleWebhook(raw, req.headers, 'bachs', trace));
   }
 
   @UseGuards(PosJwtGuard)

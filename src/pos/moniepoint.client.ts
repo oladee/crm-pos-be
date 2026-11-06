@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from 'crypto';
 import { ProviderFailure } from './payment-provider';
 import { MoniepointAccount, settingMilliseconds } from './checkout-config';
+import { auditedPspFetch, type AuditHttp } from './psp-audit';
 
 export type TerminalEvidence = {
   reference: string; transactionReference?: string; eventId: string;
@@ -18,17 +19,17 @@ function outcome(row: any, polling: boolean): TerminalEvidence['status'] {
 }
 
 export class MoniepointClient {
-  constructor(private readonly account: MoniepointAccount, private readonly baseUrl: string) {}
+  constructor(private readonly account: MoniepointAccount, private readonly baseUrl: string, private readonly audit?: AuditHttp) {}
 
   private async request(path: string, body?: unknown) {
     let response: Response;
     try {
-      response = await fetch(`${this.baseUrl}${path}`, {
+      response = await auditedPspFetch(`${this.baseUrl}${path}`, {
         method: body ? 'POST' : 'GET', headers: { Authorization: `Bearer ${process.env[this.account.apiKeyEnv] || ''}`, 'Content-Type': 'application/json' },
         body: body ? JSON.stringify(body) : undefined,
         signal: AbortSignal.timeout(settingMilliseconds('MONIEPOINT_HTTP_TIMEOUT_MS', 10_000)),
-      });
-    } catch { throw new ProviderFailure('Moniepoint result is unknown. Check the existing payment before retrying.', false); }
+      }, this.audit);
+    } catch (error) { if (error instanceof ProviderFailure) throw error; throw new ProviderFailure('Moniepoint result is unknown. Check the existing payment before retrying.', false); }
     const data = await response.json().catch(() => null);
     if (!response.ok) throw new ProviderFailure('Moniepoint could not accept or retrieve the payment.', [401, 403, 422].includes(response.status));
     return data;

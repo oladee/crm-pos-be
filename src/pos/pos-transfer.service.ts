@@ -1,4 +1,6 @@
-import { BadRequestException, ConflictException, ForbiddenException, HttpException, Injectable, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, HttpException, Inject, Injectable, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
+import type { PspAuditService } from './psp-audit.service';
+import type { WebhookTrace } from './psp-audit';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { PosJwtPayload } from './pos-auth';
@@ -19,11 +21,17 @@ export class PosTransferService {
     @InjectModel('Hub') private readonly hubs: Model<any>,
     @InjectModel('User') private readonly users: Model<any>,
     @InjectModel('Customer') private readonly customers: Model<any>,
+    @Inject('PSP_AUDIT') private readonly audit?: PspAuditService,
   ) {}
 
-  private provider(id: PaymentProviderId): PaymentProvider {
-    if (id === 'squad' && process.env.SQUAD_DVA_APPROVED === 'true' && process.env.SQUAD_CONTRACT_VERIFIED === 'true' && process.env.SQUAD_SECRET_KEY) return new SquadClient(process.env.SQUAD_SECRET_KEY);
-    if (id === 'bachs' && process.env.BACHS_API_KEY) return new BachsProvider(process.env.BACHS_API_KEY, process.env.BACHS_WEBHOOK_SECRET || '');
+  private provider(id: PaymentProviderId, row?: any): PaymentProvider {
+    if (!this.audit) throw new ServiceUnavailableException('Payment audit storage is unavailable');
+    const audit = this.audit.http({ provider_id: id, account_key: id, ...(row ? {
+      location_id: String(row.hub), device_id: row.device_id, cashier_id: String(row.cashier),
+      merchant_reference: row.client_sale_id, checkout_id: row.checkout_id, amount_kobo: row.cart_total_kobo,
+    } : {}) });
+    if (id === 'squad' && process.env.SQUAD_DVA_APPROVED === 'true' && process.env.SQUAD_CONTRACT_VERIFIED === 'true' && process.env.SQUAD_SECRET_KEY) return new SquadClient(process.env.SQUAD_SECRET_KEY, undefined, audit);
+    if (id === 'bachs' && process.env.BACHS_API_KEY) return new BachsProvider(process.env.BACHS_API_KEY, process.env.BACHS_WEBHOOK_SECRET || '', audit);
     throw new ServiceUnavailableException('This payment provider is not available');
   }
 
@@ -116,7 +124,7 @@ export class PosTransferService {
     const row = await this.transfers.findOne({ client_sale_id: clientSaleId });
     if (!row) throw new NotFoundException('Transfer not found');
     await this.scope(user, row);
-    if (refresh && UNRESOLVED.includes(row.status) && row.checkout_id) await this.applyEvidence(row.client_sale_id, await this.provider(row.provider || 'bachs').check(row.checkout_id, row.payable_kobo));
+    if (refresh && UNRESOLVED.includes(row.status) && row.checkout_id) await this.applyEvidence(row.client_sale_id, await this.provider(row.provider || 'bachs', row).check(row.checkout_id, row.payable_kobo));
     return this.view(await this.transfers.findById(row._id), user);
   }
 
@@ -177,17 +185,18 @@ export class PosTransferService {
     });
   }
 
-  async handleWebhook(raw: string, headers: Record<string, string | string[] | undefined>, providerId: PaymentProviderId = 'bachs') {
+  async handleWebhook(raw: string, headers: Record<string, string | string[] | undefined>, providerId: PaymentProviderId = 'bachs', trace?: WebhookTrace) {
     let evidence: PaymentEvidence | null;
     try { evidence = this.provider(providerId).webhook(raw, headers); }
-    catch { throw new BadRequestException('Invalid payment webhook'); }
+    catch { trace?.rejected('invalid_signature_or_payload'); throw new BadRequestException('Invalid payment webhook'); }
+    trace?.verified(evidence);
     if (!evidence) return { received: true };
     const providerFilter = providerId === 'bachs' ? { $or: [{ provider: 'bachs' }, { provider: { $exists: false } }] } : { provider: providerId };
     const row = await this.transfers.findOne({ $and: [providerFilter, { $or: [{ checkout_id: evidence.reference }, { client_sale_id: evidence.reference }] }] });
     if (row) {
       if (providerId === 'squad' && evidence.status === 'paid') {
         // DVA v2 signs reference and amount but not status. Cross-check status.
-        const checked = await this.provider('squad').check(evidence.reference, row.payable_kobo);
+        const checked = await this.provider('squad', row).check(evidence.reference, row.payable_kobo);
         if (checked.status !== 'paid') evidence = { ...evidence, status: 'review' };
       }
       await this.applyEvidence(row.client_sale_id, evidence);

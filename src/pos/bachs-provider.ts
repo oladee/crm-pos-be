@@ -1,13 +1,14 @@
 import { BachsClient, isPaidStatus, nairaToKobo, readTransferInstructions } from './bachs.client';
 import { verifyBachsSignature } from './bachs-signature';
 import { PaymentEvidence, PaymentProvider } from './payment-provider';
+import type { AuditHttp } from './psp-audit';
 export class BachsProvider implements PaymentProvider {
-  constructor(private readonly key: string, private readonly secret: string) {}
+  constructor(private readonly key: string, private readonly secret: string, private readonly audit?: AuditHttp) {}
   open(input: { clientSaleId: string; amountKobo: number; hubId: string; deviceId: string; email?: string; name?: string }) {
-    return new BachsClient(this.key).openBankTransfer(input);
+    return new BachsClient(this.key, undefined, this.audit).openBankTransfer(input);
   }
   async check(reference: string): Promise<PaymentEvidence> {
-    const result = await new BachsClient(this.key).getCheckout(reference);
+    const result = await new BachsClient(this.key, undefined, this.audit).getCheckout(reference);
     const data = (result.data || result) as Record<string, any>;
     // Checkout/request success and nested instruction statuses are not settlement.
     const settlement = data.payment_status || (['paid', 'succeeded'].includes(String(data.status).toLowerCase()) ? data.status : '');

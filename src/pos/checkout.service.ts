@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, OnModuleDestroy, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, NotFoundException, OnModuleDestroy, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { InjectConnection } from '@nestjs/mongoose';
 import { Connection, Model, Types } from 'mongoose';
 import { randomUUID } from 'crypto';
@@ -8,6 +8,8 @@ import { checkoutConfiguration, settingMilliseconds } from './checkout-config';
 import { MoniepointClient, TerminalEvidence } from './moniepoint.client';
 import { SquadClient } from './squad.client';
 import { ProviderFailure } from './payment-provider';
+import type { PspAuditService } from './psp-audit.service';
+import type { WebhookTrace } from './psp-audit';
 
 const ACTIVE = ['queued', 'pending', 'unknown', 'review'];
 const money = (value: unknown) => {
@@ -22,7 +24,18 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
   private timer?: ReturnType<typeof setInterval>;
   private working = false;
   private readonly worker = randomUUID();
-  constructor(@InjectConnection() private readonly db: Connection, private readonly pos: PosService) {}
+  constructor(@InjectConnection() private readonly db: Connection, private readonly pos: PosService, @Inject('PSP_AUDIT') private readonly audit: PspAuditService) {}
+  private auditHttp(attempt: any) {
+    return this.audit.http({ provider_id: attempt.provider, account_key: attempt.account_key, attempt_id: String(attempt._id),
+      checkout_id: String(attempt.checkout), merchant_reference: attempt.merchant_reference, terminal_serial: attempt.terminal_serial,
+      location_id: String(attempt.audit_location || ''), device_id: attempt.audit_device, cashier_id: attempt.audit_cashier,
+      business_id: attempt.account_snapshot?.businessId, business_owner_id: attempt.account_snapshot?.businessOwnerId, amount_kobo: attempt.amount_kobo });
+  }
+  private async auditedAttempt(attempt: any) {
+    const checkout = await this.model('PosCheckout').findById(attempt.checkout).lean();
+    return { ...(attempt.toObject ? attempt.toObject() : attempt), audit_location: checkout?.hub,
+      audit_device: checkout?.device_id, audit_cashier: checkout?.cashier ? String(checkout.cashier) : undefined };
+  }
   private model(name: string): Model<any> { return this.db.model(name) as unknown as Model<any>; }
   private atomic<T>(work: () => Promise<T>): Promise<T> { return this.pos.inventoryTransaction(work); }
 
@@ -209,13 +222,13 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     if (!claimed) return;
     try {
       if (claimed.provider === 'moniepoint') {
-        await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl).open(claimed.merchant_reference, claimed.terminal_serial, claimed.amount_kobo, claimed.method);
+        await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl, this.auditHttp(await this.auditedAttempt(claimed))).open(claimed.merchant_reference, claimed.terminal_serial, claimed.amount_kobo, claimed.method);
       } else {
         const row = await this.model('PosCheckout').findById(claimed.checkout);
         const staff = await this.model('User').findById(row.cashier).lean();
         const customer = await this.model('Customer').findById(row.customer).lean();
         const email = customer?.customer_email || customer?.email || staff?.email;
-        const opened = await this.squad().open({ clientSaleId: claimed.merchant_reference, amountKobo: claimed.amount_kobo, email });
+        const opened = await this.squad(await this.auditedAttempt(claimed)).open({ clientSaleId: claimed.merchant_reference, amountKobo: claimed.amount_kobo, email });
         await this.model('PosPaymentAttempt').updateOne({ _id: claimed._id }, { $set: { instructions: opened, payable_kobo: opened.payableKobo, fee_kobo: opened.payableKobo - claimed.amount_kobo } });
       }
     } catch (error) {
@@ -233,21 +246,24 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private squad() { return new SquadClient(process.env.SQUAD_SECRET_KEY || '', process.env.SQUAD_API_BASE_URL || undefined); }
+  private squad(attempt?: any) { return new SquadClient(process.env.SQUAD_SECRET_KEY || '', process.env.SQUAD_API_BASE_URL || undefined,
+    attempt ? this.auditHttp(attempt) : this.audit.http({ provider_id: 'squad', account_key: 'squad' })); }
 
-  async receiveMoniepoint(accountKey: string, raw: string, headers: Record<string, any>) {
+  async receiveMoniepoint(accountKey: string, raw: string, headers: Record<string, any>, trace?: WebhookTrace) {
     const config = checkoutConfiguration(), account = config.accounts[accountKey];
-    if (!account) throw new BadRequestException('Unknown payment subscription');
+    if (!account) { trace?.rejected('unknown_account'); throw new BadRequestException('Unknown payment subscription'); }
     let evidence: TerminalEvidence | null;
     try { evidence = new MoniepointClient(account, config.baseUrl).webhook(raw, headers); }
-    catch { throw new BadRequestException('Invalid payment webhook'); }
+    catch { trace?.rejected('invalid_signature_or_business'); throw new BadRequestException('Invalid payment webhook'); }
+    trace?.verified(evidence);
     if (evidence) await this.enqueue('moniepoint', accountKey, evidence);
     return { received: true };
   }
 
-  async receiveSquad(raw: string, headers: Record<string, any>): Promise<boolean> {
+  async receiveSquad(raw: string, headers: Record<string, any>, trace?: WebhookTrace): Promise<boolean> {
     let event;
-    try { event = this.squad().webhook(raw, headers); } catch { throw new BadRequestException('Invalid payment webhook'); }
+    try { event = this.squad().webhook(raw, headers); } catch { trace?.rejected('invalid_signature'); throw new BadRequestException('Invalid payment webhook'); }
+    trace?.verified(event);
     if (!event) return true;
     if (!await this.model('PosPaymentAttempt').exists({ provider: 'squad', merchant_reference: event.reference }) &&
       await this.model('PosTransfer').exists({ provider: 'squad', $or: [{ client_sale_id: event.reference }, { checkout_id: event.reference }] })) return false;
@@ -273,9 +289,9 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     if (!claimed) return;
     try {
       let event: any;
-      if (claimed.provider === 'moniepoint') event = await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl).check(claimed.merchant_reference);
+      if (claimed.provider === 'moniepoint') event = await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl, this.auditHttp(await this.auditedAttempt(claimed))).check(claimed.merchant_reference);
       else {
-        const checked = await this.squad().check(claimed.merchant_reference);
+        const checked = await this.squad(await this.auditedAttempt(claimed)).check(claimed.merchant_reference);
         event = { ...checked, status: checked.status === 'paid' ? 'paid' : checked.status === 'expired' ? 'review' : 'pending', method: 'Transfer' };
         // A query result without a stable transaction ID cannot consume a payment twice.
         if (event.status === 'paid' && !event.transactionReference) event.status = 'review';
@@ -451,7 +467,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
         try {
           const attempt = await this.model('PosPaymentAttempt').findOne({ provider: event.provider, account_key: event.account_key, merchant_reference: event.evidence.reference });
           if (attempt?.provider === 'squad' && event.evidence.status === 'paid') {
-            const checked = await this.squad().check(attempt.merchant_reference);
+            const checked = await this.squad(await this.auditedAttempt(attempt)).check(attempt.merchant_reference);
             if (checked.status !== 'paid') throw new Error('Await provider query confirmation');
           }
           // Do not consume early Squad evidence until the account-creation response confirms fees.
