@@ -2,7 +2,7 @@ jest.mock('@nestjs/mongoose', () => ({ InjectModel: () => () => undefined }));
 jest.mock('@nestjs/jwt', () => ({ JwtService: class {} }));
 jest.mock('./pos-passkey.service', () => ({ PosPasskeyService: class {} }));
 
-import { ForbiddenException } from '@nestjs/common';
+import { ConflictException, ForbiddenException } from '@nestjs/common';
 import { PosService } from './pos.service';
 import type { PosJwtPayload } from './pos-auth';
 
@@ -34,16 +34,17 @@ describe('authenticated till attribution', () => {
   });
 
   it('records the session device and converts kobo to naira', async () => {
-    const result = await service.createSale(user, { clientSaleId: 'sale-1' });
+    const result = await service.createSale(user, { clientSaleId: 'sale-1' }, { total: 12345, lines: [] });
     expect(result.data).toMatchObject({
       device_id: 'till-A',
       amount: 123.45,
       hub: expect.anything(),
     });
-    expect(state.deviceModel.findOne).toHaveBeenCalledWith({
-      device_id: 'till-A',
-      revoked: { $ne: true },
-    });
+    expect(state.priceCart).not.toHaveBeenCalled();
+  });
+  it('rejects new direct sales without a trusted payment snapshot', async () => {
+    await expect(service.createSale(user, { clientSaleId: 'legacy-bypass' })).rejects.toThrow(ConflictException);
+    expect(state.saleModel.create).not.toHaveBeenCalled();
   });
 
   it('rejects a client-supplied device from another session before writing', async () => {
@@ -94,7 +95,7 @@ describe('authenticated till attribution', () => {
   });
 
   it('attributes refunds and voids to the validated originating session device', async () => {
-    const original = { hub, amount: 123.45, items: [], save: jest.fn() };
+    const original = { hub, agent: user.sub, amount: 123.45, items: [], save: jest.fn() };
     state.saleModel.findOne.mockImplementation((query) =>
       query.client_sale_id === 'original'
         ? Promise.resolve(original)

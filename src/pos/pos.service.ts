@@ -1046,7 +1046,7 @@ export class PosService {
       return { data: existing, idempotent: true };
     }
 
-    if (!snapshot && process.env.POS_CHECKOUT_V2_ENABLED === 'true') {
+    if (!snapshot) {
       throw new ConflictException('Update this till and use the customer checkout flow');
     }
 
@@ -1155,6 +1155,9 @@ export class PosService {
     if (!original) throw new NotFoundException('Original sale not found');
     if (String(original.hub) !== hubId) {
       throw new ForbiddenException('Sale belongs to another location');
+    }
+    if (user.role !== 'manager' && String(original.agent) !== user.sub) {
+      throw new ForbiddenException('You cannot change another cashier\'s transaction');
     }
 
     const sourceLines = payload.lines || payload.items || original.items || (original.item ? [original.item] : []);

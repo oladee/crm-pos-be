@@ -9,10 +9,11 @@ export class BachsProvider implements PaymentProvider {
   async check(reference: string): Promise<PaymentEvidence> {
     const result = await new BachsClient(this.key).getCheckout(reference);
     const data = (result.data || result) as Record<string, any>;
-    const read = readTransferInstructions(result, 0);
+    // Checkout/request success and nested instruction statuses are not settlement.
+    const settlement = data.payment_status || (['paid', 'succeeded'].includes(String(data.status).toLowerCase()) ? data.status : '');
     const amount = data.amount_received ?? data.paid_amount;
     return { reference: String(data.checkout_id || data.id || data.reference || ''), eventId: `poll:${reference}`,
-      status: isPaidStatus(read.status) ? 'paid' : read.status.toLowerCase() === 'expired' ? 'expired' : 'awaiting',
+      status: isPaidStatus(String(settlement)) ? 'paid' : String(data.status).toLowerCase() === 'expired' ? 'expired' : 'awaiting',
       amountKobo: amount == null ? undefined : nairaToKobo(amount), currency: data.currency };
   }
   webhook(raw: string, headers: Record<string, string | string[] | undefined>): PaymentEvidence | null {
@@ -22,6 +23,7 @@ export class BachsProvider implements PaymentProvider {
     if (!event.id || !reference) return null;
     if (event.type === 'checkout.expired') return { reference, eventId: event.id, status: 'expired' };
     if (!['collection.succeeded', 'checkout.completed'].includes(event.type) || (data.status && !isPaidStatus(data.status))) return null;
+    if (event.type === 'checkout.completed' && !isPaidStatus(String(data.payment_status || ''))) return null;
     return { reference, eventId: String(event.id), status: 'paid', amountKobo: nairaToKobo(data.amount), currency: data.currency };
   }
 }

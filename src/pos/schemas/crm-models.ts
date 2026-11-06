@@ -108,6 +108,9 @@ export const SaleSchema = new Schema(
   { collection: 'sales', timestamps: true },
 );
 
+SaleSchema.index({ hub: 1, reversal_of: 1 });
+SaleSchema.index({ hub: 1, date: -1 });
+
 export const CustomerSchema = new Schema(
   {
     email: String,

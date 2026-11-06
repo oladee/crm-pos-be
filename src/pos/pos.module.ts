@@ -9,6 +9,8 @@ import { PosTransferService } from './pos-transfer.service';
 import { PosJwtGuard } from './pos-auth';
 import { CheckoutController } from './checkout.controller';
 import { CheckoutService } from './checkout.service';
+import { TransactionsService } from './transactions.service';
+import { TransactionsController } from './transactions.controller';
 import { CreditRecordSchema, PosCheckoutSchema, PosPaymentAttemptSchema, PosProviderTransactionSchema, PosTerminalLockSchema, PosWebhookInboxSchema } from './schemas/checkout-models';
 import {
   CustomerSchema,
@@ -63,7 +65,7 @@ import {
       }),
     }),
   ],
-  controllers: [PosController, CheckoutController],
-  providers: [PosService, PosPasskeyService, PosTransferService, PosJwtGuard, CheckoutService],
+  controllers: [PosController, CheckoutController, TransactionsController],
+  providers: [PosService, PosPasskeyService, PosTransferService, PosJwtGuard, CheckoutService, TransactionsService],
 })
 export class PosModule {}

@@ -32,7 +32,6 @@ export class PosTransferService {
     const hub = await this.hubs.findById(user.hubId).lean();
     const providers: Array<{ id: PaymentProviderId; name: string }> = [];
     if (process.env.POS_PAYMENT_RESERVATIONS_ENABLED === 'true' && await this.rolloutReady()) {
-      if (process.env.BACHS_API_KEY) providers.push({ id: 'bachs', name: 'Bachs' });
       if (process.env.SQUAD_DVA_APPROVED === 'true' && process.env.SQUAD_CONTRACT_VERIFIED === 'true' && process.env.SQUAD_SECRET_KEY) providers.push({ id: 'squad', name: 'Squad' });
     }
     return { providers, manualConfirmationEnabled: hub?.pos_manual_payment_confirmation === true };
@@ -83,103 +82,13 @@ export class PosTransferService {
   }
 
   async start(user: PosJwtPayload, payload: Record<string, any>) {
-    let stage = 'validation';
-    const context = { provider: payload.provider === 'squad' ? 'squad' : 'bachs',
-      clientSaleId: paymentLogText(payload.clientSaleId), hubId: user.hubId, deviceId: user.deviceId,
-      lineCount: Array.isArray(payload.lines) ? payload.lines.length : 0 };
-    const started = Date.now();
-    this.logger.log({ event: 'transfer.start', ...context });
-    try {
     const clientSaleId = String(payload.clientSaleId || '').trim();
     if (!clientSaleId) throw new BadRequestException('clientSaleId is required');
     if (!user.deviceId || (payload.deviceId && payload.deviceId !== user.deviceId)) throw new ForbiddenException('Session is scoped to another till');
-    if ((payload.hubId || payload.storeId || user.hubId) !== user.hubId) throw new ForbiddenException('This till is bound to another location');
-    stage = 'authorization';
     await this.scope(user, { hub: user.hubId, cashier: user.sub });
-    stage = 'existing_payment';
     const existing = await this.transfers.findOne({ client_sale_id: clientSaleId });
     if (existing) { await this.scope(user, existing); return this.view(existing, user); }
-    if (process.env.POS_CHECKOUT_V2_ENABLED === 'true') throw new ConflictException('Update this till and use the customer checkout flow');
-    stage = 'rollout_preflight';
-    if (process.env.POS_PAYMENT_RESERVATIONS_ENABLED !== 'true' || !await this.rolloutReady()) throw new ServiceUnavailableException('Reserved payments are not ready. Run the inventory reservation preflight and backfill first.');
-    const providerId: PaymentProviderId = payload.provider || 'bachs';
-    stage = 'provider_configuration';
-    const provider = this.provider(providerId);
-    const identity = await this.buyerIdentity(payload, user);
-    stage = 'quote';
-    await this.pos.quoteSale(user, payload);
-    stage = 'reservation';
-    let row: any;
-    try {
-      row = await this.pos.inventoryTransaction(async () => {
-        const reservation = await this.pos.reservePayment(user, payload);
-        const [created] = await this.transfers.create([{
-          client_sale_id: clientSaleId, provider: providerId, hub: new Types.ObjectId(user.hubId), device_id: user.deviceId,
-          cashier: new Types.ObjectId(user.sub), cashier_name: payload.cashierName, status: 'initializing',
-          cart_total_kobo: reservation.snapshot.total, payable_kobo: reservation.snapshot.total, currency: 'NGN',
-          reservation_state: 'held', allocations: reservation.allocations, priced_snapshot: reservation.snapshot,
-          sale_payload: { ...payload, hubId: user.hubId, deviceId: user.deviceId, total: reservation.snapshot.total },
-        }]);
-        return created;
-      });
-    } catch (error: any) {
-      if (error?.code !== 11000) throw error;
-      const duplicate = await this.transfers.findOne({ client_sale_id: clientSaleId });
-      if (!duplicate) throw error;
-      await this.scope(user, duplicate); return this.view(duplicate, user);
-    }
-    try {
-      // Never hold a MongoDB transaction open across a provider network call.
-      stage = 'provider_open';
-      this.logger.log({ event: 'transfer.provider_open', ...context, amountKobo: row.cart_total_kobo });
-      const opened = await provider.open({ clientSaleId, amountKobo: row.cart_total_kobo, hubId: user.hubId, deviceId: user.deviceId!, email: identity.email, name: identity.name });
-      if (opened.currency !== 'NGN' || !Number.isSafeInteger(opened.payableKobo) || opened.payableKobo < row.cart_total_kobo) throw new ProviderFailure('Provider returned invalid amount or currency; reconcile this payment.', false);
-      stage = 'save_instructions';
-      const updated = await this.pos.inventoryTransaction(async () => {
-        const current = await this.lock(clientSaleId);
-        current.checkout_id = opened.checkoutId;
-        current.bank_name = opened.bankName; current.account_name = opened.accountName;
-        current.account_number = opened.accountNumber; current.payable_kobo = opened.payableKobo;
-        current.fee_kobo = opened.payableKobo - current.cart_total_kobo;
-        current.expires_at = opened.expiresAt ? new Date(opened.expiresAt) : undefined;
-        if (current.status === 'initializing') current.status = 'awaiting';
-        await current.save(); return current;
-      });
-      // A webhook can arrive before the account-creation response. Replay it after
-      // the expected amount is known, retaining cancelled transactions for review.
-      stage = 'reconcile';
-      this.logger.log({ event: 'transfer.ready', ...context, elapsedMs: Date.now() - started });
-      for (const pending of updated.reconciliation_events || []) await this.applyEvidence(clientSaleId, pending);
-      return this.view(await this.transfers.findById(row._id), user);
-    } catch (error) {
-      const definite = error instanceof ProviderFailure && error.definite;
-      this.logger.warn({ event: 'transfer.provider_failed', ...context, stage,
-        exception: error instanceof Error ? error.constructor.name : 'UnknownError',
-        reason: paymentLogText(error instanceof Error ? error.message : 'Unknown failure'),
-        definite, elapsedMs: Date.now() - started });
-      const cashierReason = context.provider === 'bachs'
-        ? (definite && error instanceof Error ? error.message : TRANSFER_NEEDS_REVIEW)
-        : (error instanceof Error ? error.message : 'Provider result unknown');
-      await this.pos.inventoryTransaction(async () => {
-        const current = await this.lock(row.client_sale_id);
-        if (current.status !== 'initializing') return;
-        if (definite) {
-          await this.pos.releasePayment(current.allocations); current.reservation_state = 'released'; current.status = 'cancelled';
-        } else current.status = 'review';
-        current.reconciliation_reason = cashierReason;
-        await current.save();
-      });
-      if (context.provider === 'bachs' && definite) throw new BadRequestException(cashierReason);
-      return this.view(await this.transfers.findById(row._id), user);
-    }
-    } catch (error) {
-      this.logger.warn({ event: 'transfer.rejected', ...context, stage,
-        exception: error instanceof Error ? error.constructor.name : 'UnknownError',
-        httpStatus: error instanceof HttpException ? error.getStatus() : 500,
-        reason: paymentLogText(error instanceof Error ? error.message : 'Unknown failure'),
-        elapsedMs: Date.now() - started });
-      throw error;
-    }
+    throw new ConflictException('Use the customer checkout flow to start a new payment');
   }
 
   private async lock(clientSaleId: string) {

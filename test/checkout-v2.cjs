@@ -47,7 +47,7 @@ describe('customer checkout and payment recovery', () => {
   }
 
   before(async () => {
-    process.env.POS_PAYMENT_WORKER_ENABLED = 'false'; process.env.POS_CHECKOUT_V2_ENABLED = 'true'; process.env.POS_PAYMENT_RESERVATIONS_ENABLED = 'true';
+    process.env.POS_PAYMENT_WORKER_ENABLED = 'false'; process.env.POS_PAYMENT_RESERVATIONS_ENABLED = 'true';
     process.env.MONIEPOINT_ENABLED = 'true'; process.env.MONIEPOINT_TEST_API_KEY = 'test-key'; process.env.MONIEPOINT_TEST_SECRET = 'test-webhook-secret';
     process.env.SQUAD_ENABLED = 'true'; process.env.SQUAD_DVA_APPROVED = 'true'; process.env.SQUAD_CONTRACT_VERIFIED = 'true'; process.env.SQUAD_SECRET_KEY = 'sandbox_test';
     process.env.MONIEPOINT_ACCOUNTS_JSON = JSON.stringify({ lagos: { businessId: '100', businessOwnerId: '101', apiKeyEnv: 'MONIEPOINT_TEST_API_KEY', webhookSecretEnv: 'MONIEPOINT_TEST_SECRET' } });
@@ -127,6 +127,65 @@ describe('customer checkout and payment recovery', () => {
     assert.equal(results[0].data.receipt.receiptPayment.confirmationSource, 'manual');
     assert.equal((await db.model('Customer').findById(customer)).total_orders, 1);
   });
+  it('always offers standard checkout and explains missing providers without activation gating', async () => {
+    process.env.MONIEPOINT_TERMINALS_JSON = '{}';
+    process.env.SQUAD_ENABLED = 'false';
+    try {
+      const options = await api('/checkouts/options');
+      assert.equal(options.data.enabled, true);
+      assert.match(options.data.methods.find(method => method.id === 'moniepoint').reason, /No Moniepoint terminal/);
+      assert.equal(options.data.methods.find(method => method.id === 'squad').available, false);
+      const row = await create('always-standard');
+      assert.equal(row.status, 'awaiting'); assert.equal(row.receipt, null);
+      assert.equal(await db.model('Sale').countDocuments(), 0);
+      assert.equal((await api('/payments/transfers', { ...draft('blocked-legacy'), provider: 'bachs' })).status, 409);
+      assert.equal((await api('/sales', draft('blocked-direct'))).status, 409);
+    } finally {
+      process.env.MONIEPOINT_TERMINALS_JSON = JSON.stringify({ 'till-1': { hubId: String(hub), accountKey: 'lagos', terminalSerial: 'SERIAL-1' } });
+      process.env.SQUAD_ENABLED = 'true';
+    }
+  });
+  it('shares read-only location receipts across tills without granting payment management', async () => {
+    const row = await create('shared-location'); await manual(row);
+    const otherCashier = new Types.ObjectId();
+    const role = await db.model('Role').findOne({ name: 'cashier' });
+    await db.model('User').create({ _id: otherCashier, full_name: 'Other Cashier', role: role._id, hub });
+    await db.model('PosDevice').create({ device_id: 'till-2', hub, label: 'Other Till' });
+    const jwt = app.get(require('@nestjs/jwt').JwtService);
+    const otherToken = jwt.sign({ sub: String(otherCashier), role: 'cashier', hubId: String(hub), deviceId: 'till-2' });
+    const page = await api('/transactions', undefined, otherToken);
+    assert.equal(page.status, 200, JSON.stringify(page.data)); assert.equal(page.data.data.length, 1);
+    const detail = await api('/transactions/shared-location', undefined, otherToken);
+    assert.equal(detail.data.actions.printReceipt, true); assert.equal(detail.data.actions.refund, false);
+    assert.equal(detail.data.receipt.id, 'shared-location'); assert.equal(detail.data.locationId, String(hub));
+    assert.equal(detail.data.receipt.origin.deviceLabel, undefined);
+    assert.equal(detail.data.sale_payload, undefined); assert.equal(detail.data.account_snapshot, undefined);
+    assert.equal((await api(`/checkouts/${row.id}/confirm-received`, { amountKobo: row.dueKobo, actualMethod: 'Cash', account: 'drawer', reason: 'test', confirmed: true }, otherToken)).status, 403);
+    assert.equal((await api('/sales/shared-location/refund', { reversalId: 'forbidden-refund' }, otherToken)).status, 403);
+    const foreignHub = new Types.ObjectId();
+    await db.model('Hub').create({ _id: foreignHub, hub_name: 'Other location', is_active: true });
+    await db.model('User').updateOne({ _id: otherCashier }, { hub: foreignHub });
+    await db.model('PosDevice').updateOne({ device_id: 'till-2' }, { hub: foreignHub });
+    const foreignToken = jwt.sign({ sub: String(otherCashier), role: 'cashier', hubId: String(foreignHub), deviceId: 'till-2' });
+    assert.equal((await api('/transactions/shared-location', undefined, foreignToken)).status, 404);
+    assert.equal((await api('/transactions', undefined, foreignToken)).data.data.length, 0);
+    assert.equal(await db.model('Sale').countDocuments(), 1);
+    assert.equal((await db.model('Product').findById(product)).current_stock, 8);
+  });
+  it('paginates and filters checkout history without duplicating its legacy sale records', async () => {
+    const rows = Array.from({ length: 53 }, (_, index) => ({ client_sale_id: 'page-' + index, hub, device_id: 'till-1', cashier,
+      customer, customer_name: index % 2 ? 'Ada' : 'Bola', kind: 'sale', mode: 'full_payment', total_kobo: 100,
+      due_kobo: 100, status: 'awaiting', createdAt: new Date('2026-11-05T10:00:00Z') }));
+    await db.model('PosCheckout').insertMany(rows);
+    const page = await api('/transactions'); assert.equal(page.data.data.length, 50); assert.ok(page.data.nextCursor);
+    const second = await api('/transactions?before=' + page.data.nextCursor); assert.equal(second.data.data.length, 3);
+    assert.equal(new Set([...page.data.data, ...second.data.data].map(row => row.reference)).size, 53);
+    const filtered = await api('/transactions?q=Ada&date=2026-11-05&status=awaiting');
+    assert.equal(filtered.data.data.length, 26);
+    assert.equal((await api('/transactions?before=invalid')).status, 400);
+    assert.equal((await api('/transactions?q=.*')).data.data.length, 0);
+    const pending = await api('/transactions/page-0'); assert.equal(pending.data.receipt, null);
+  });
   it('records full and partial credit without treating debt as money received', async () => {
     const full = await create('full-credit', { paymentMode: 'full_credit', dueDate: '2099-01-01' }); assert.equal(full.status, 'completed');
     const partial = await create('partial-credit', { paymentMode: 'partial_credit', upfrontKobo: 8000, dueDate: '2099-01-01' });
@@ -200,6 +259,29 @@ describe('customer checkout and payment recovery', () => {
     assert.equal(retry.data.creditBalanceKobo, 2000); assert.equal(retry.data.refundPaidKobo, 0);
     assert.equal(await db.model('Sale').countDocuments(), 2);
     assert.equal((await db.model('Product').findById(product)).current_stock, 9);
+    const history = await api('/transactions/refund-credit');
+    assert.equal(history.data.receipt.returnedQty[String(product)], 1);
+  });
+  it('finishes an existing Bachs transfer without allowing a new Bachs request', async () => {
+    const pos = app.get(require('../dist/pos/pos.service').PosService);
+    let reservation;
+    await pos.inventoryTransaction(async () => {
+      reservation = await pos.reservePayment(actor, draft('existing-bachs'));
+      await db.model('PosTransfer').create({ client_sale_id: 'existing-bachs', checkout_id: 'legacy-account', provider: 'bachs', hub,
+        device_id: 'till-1', cashier, cashier_name: 'Cashier', status: 'awaiting', reservation_state: 'held',
+        cart_total_kobo: reservation.snapshot.total, payable_kobo: reservation.snapshot.total, priced_snapshot: reservation.snapshot,
+        allocations: reservation.allocations, sale_payload: { ...draft('existing-bachs'), customerName: 'Buyer' } });
+    });
+    assert.equal((await api('/payments/transfers', { clientSaleId: 'existing-bachs' })).data.status, 'awaiting');
+    assert.equal((await api('/payments/transfers', { ...draft('new-bachs'), provider: 'bachs' })).status, 409);
+    await db.model('Hub').updateOne({ _id: hub }, { pos_manual_payment_confirmation: true });
+    assert.equal((await api('/payments/transfers/existing-bachs/confirm-received', {})).status, 201);
+    // Older transfers may predate stored priced snapshots; the saved sale remains printable.
+    await db.model('PosTransfer').updateOne({ client_sale_id: 'existing-bachs' }, { $unset: { priced_snapshot: '' } });
+    const history = await api('/transactions');
+    assert.equal(history.data.data.length, 1); assert.equal(history.data.data[0].receipt.receiptPayment.provider, 'bachs');
+    assert.equal(await db.model('Sale').countDocuments(), 1);
+    assert.equal((await db.model('Product').findById(product)).current_stock, 8);
   });
   it('serializes CRM and POS repayments against the same ledger', async () => {
     require('../../fud-farmer-crm-be/node_modules/tsconfig-paths').register({ baseUrl: require('path').resolve(__dirname, '../../fud-farmer-crm-be/dist'), paths: { 'src/*': ['*'] } });

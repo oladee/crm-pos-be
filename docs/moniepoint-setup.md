@@ -1,6 +1,6 @@
 # Customer checkout activation
 
-The new checkout is disabled by default. No live keys, subscriptions or terminal calls are created by installation.
+Customer checkout is the standard flow on every till. Moniepoint and Squad remain individually disabled until configured. No live keys, subscriptions or terminal calls are created by installation.
 
 ## Configure the backend
 
@@ -32,11 +32,11 @@ For Squad use its existing key, approval and contract flags plus `SQUAD_ENABLED=
 
 ## Check and activate
 
-1. Build with `pnpm build` and run `node dist/scripts/check-checkout-config.js`. It validates profile references, enrolled tills and inventory rollout without printing credentials. A deliberately unconfigured provider can remain disabled; manual collection still works once checkout/reservations are enabled.
+1. Build with `pnpm build` and run `node dist/scripts/check-checkout-config.js`. It validates profile references, enrolled tills and inventory rollout without printing credentials. A deliberately unconfigured provider can remain disabled; manual collection still works once inventory reservations are ready.
 2. Run tests against local HTTP provider simulations and a local MongoDB replica set. Do not point tests at the deployment database.
 3. Before live use, test a known amount on a real terminal in both card and transfer modes. Confirm amount units, merchant reference round-trip, business/terminal IDs, response codes, success states, fees, signature and status query. The adapter recognizes documented successful codes `00`/`20000` with successful states; `PROCESSED` alone never establishes receipt.
-4. Deploy CRM customer/credit compatibility changes, POS backend and PWA together. Keep new checkout disabled until tills receive the new frontend. Finish the existing inventory reservation preflight/backfill; retain its guards.
-5. Set `POS_PAYMENT_RESERVATIONS_ENABLED=true`, `POS_CHECKOUT_V2_ENABLED=true` and configured provider flags. Keep `POS_PAYMENT_WORKER_ENABLED=true` on at least one backend process. Worker leases support multiple instances.
+4. Deploy CRM customer/credit compatibility changes on update first, then POS backend protections/read APIs, then the PWA on dev. Finish the existing inventory reservation preflight/backfill before tills take new checkouts; retain its guards.
+5. Set `POS_PAYMENT_RESERVATIONS_ENABLED=true` and only the configured provider flags. Keep `POS_PAYMENT_WORKER_ENABLED=true` on at least one backend process. Worker leases support multiple instances.
 
 No code edits are needed when keys arrive: supply profiles, device mappings and secrets, register webhook URLs, run the checks and enable the flags.
 
@@ -50,7 +50,7 @@ Timeouts, missing references, amount mismatches, payments after cancellation and
 
 Backend flags disable new requests, not existing receipt recovery, polling or incoming event processing. The worker stores an inbox before acknowledging signed webhooks and retries interrupted processing. Monitor pending/unknown attempts, inbox reviews, terminal locks and old stock holds. Unscoped events from unknown terminals remain in the inbox for operational investigation; never assign them to a location by guessing.
 
-Legacy Bachs/Squad transfers remain completable. Once V2 is enabled, old direct-sale/new-transfer writes are rejected after idempotent existing-record lookup. Quotes and historical data are unaffected. No stock/customer backfill and no automated provider refunds are performed.
+Legacy Bachs/Squad transfers remain completable. Old direct-sale/new-transfer writes are always rejected after idempotent existing-record lookup. Quotes and historical data are unaffected. No stock/customer backfill and no automated provider refunds are performed.
 
 Provider references: https://teamapt.atlassian.net/wiki/spaces/EI/pages/2100625533 and https://teamapt.atlassian.net/wiki/spaces/EI/pages/1492648078/Webhooks
 
@@ -59,3 +59,9 @@ Provider references: https://teamapt.atlassian.net/wiki/spaces/EI/pages/21006255
 Build both CRM and POS backends first. `node --test test/checkout-config.cjs test/checkout-v2.cjs` runs configuration checks and the real Nest routes against disposable MongoDB transactions and local HTTP simulations. The cross-service repayment test loads the adjacent `fud-farmer-crm-be/dist/credits/credits.service.js`; keep that CRM build current. Set `MONGOMS_SYSTEM_BINARY` to a locally installed `mongod` when automatic downloads are unavailable.
 
 In the PWA run `pnpm exec playwright test e2e/checkout-v2.spec.ts e2e/payment-confirmation.spec.ts --workers=1`. HTTP simulations verify adapter and accounting behavior, not Moniepoint certification. Live merchant-reference propagation, amount units, fees, signatures and physical receipt output still require the real terminal.
+
+## Transactions and 58 mm printing
+
+Cashiers can view and reprint all transactions at their assigned location from Transactions. GET /pos/transactions supports q, date (Africa/Lagos trading date), status and before (opaque pagination cursor); GET /pos/transactions/:reference returns location-scoped receipt data and permitted actions. Viewing another till’s receipt does not grant payment-management rights or change local inventory. Cached history is labelled offline and stays scoped to its location.
+
+Receipts, mid-shift (X), close-shift (Z) and manager reports share 58 mm roll / 48 mm content styles. Print previews wrap names/references and grow without a fixed height; long content may continue over multiple printer pages. Previewing, cancelling or repeating printing never records payment or closes a shift. Calibrate actual paper fit, page breaks, final feed and paper-out recovery on the Z92 Android print interface before hardware acceptance.

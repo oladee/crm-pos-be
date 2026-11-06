@@ -21,7 +21,7 @@ async function main() {
     }
     const marker = await db.collection('pos_payment_rollout').findOne({ _id: 'reservations-v1' as any });
     if (marker?.ready !== true) issues.push('Inventory reservation rollout is not ready');
-    console.log(JSON.stringify({ checkoutEnabled: process.env.POS_CHECKOUT_V2_ENABLED === 'true', moniepointEnabled: process.env.MONIEPOINT_ENABLED === 'true',
+    console.log(JSON.stringify({ checkoutEnabled: true, moniepointEnabled: process.env.MONIEPOINT_ENABLED === 'true',
       accountCount: Object.keys(config.accounts).length, terminalCount: Object.keys(config.terminals).length, valid: issues.length === 0, issues }));
     if (issues.length) process.exitCode = 1;
   } finally { await app.close(); }

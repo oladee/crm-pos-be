@@ -25,7 +25,6 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
   constructor(@InjectConnection() private readonly db: Connection, private readonly pos: PosService) {}
   private model(name: string): Model<any> { return this.db.model(name) as unknown as Model<any>; }
   private atomic<T>(work: () => Promise<T>): Promise<T> { return this.pos.inventoryTransaction(work); }
-  private enabled() { if (process.env.POS_CHECKOUT_V2_ENABLED !== 'true') throw new ServiceUnavailableException('New checkout is not enabled'); }
 
   onModuleInit() {
     if (process.env.POS_PAYMENT_WORKER_ENABLED === 'false') return;
@@ -58,9 +57,13 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     const config = checkoutConfiguration(), mapping = config.terminals[user.deviceId || ''];
     const moniepoint = process.env.MONIEPOINT_ENABLED === 'true' && !config.errors.length && mapping?.hubId === user.hubId;
     const squad = process.env.SQUAD_ENABLED === 'true' && process.env.SQUAD_DVA_APPROVED === 'true' && process.env.SQUAD_CONTRACT_VERIFIED === 'true' && Boolean(process.env.SQUAD_SECRET_KEY);
-    return { enabled: process.env.POS_CHECKOUT_V2_ENABLED === 'true', methods: [
-      { id: 'moniepoint', name: 'Moniepoint', available: Boolean(moniepoint) },
-      { id: 'squad', name: 'Squad', available: squad }, { id: 'manual', name: 'Confirm payment received', available: true },
+    const moniepointReason = !mapping || mapping.hubId !== user.hubId ? 'No Moniepoint terminal configured for this till.' :
+      config.errors.length ? 'Moniepoint configuration needs attention.' : process.env.MONIEPOINT_ENABLED !== 'true' ? 'Moniepoint is currently disabled.' : null;
+    const squadReason = !process.env.SQUAD_SECRET_KEY || process.env.SQUAD_DVA_APPROVED !== 'true' || process.env.SQUAD_CONTRACT_VERIFIED !== 'true' ?
+      'Squad is not configured.' : process.env.SQUAD_ENABLED !== 'true' ? 'Squad is currently disabled.' : null;
+    return { enabled: true, methods: [
+      { id: 'moniepoint', name: 'Moniepoint', available: Boolean(moniepoint), reason: moniepointReason },
+      { id: 'squad', name: 'Squad', available: squad, reason: squadReason }, { id: 'manual', name: 'Confirm payment received', available: true, reason: null },
     ] };
   }
 
@@ -78,7 +81,6 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
   }
 
   async create(user: PosJwtPayload, input: any, repayment = false) {
-    this.enabled();
     const { staff } = await this.actor(user);
     const customer = await this.customer(user, input.customerId);
     const clientSaleId = String(input.clientSaleId || '').trim();
@@ -159,7 +161,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
   }
 
   async attempt(user: PosJwtPayload, id: string, input: any) {
-    this.enabled(); const checkout = await this.row(user, id);
+    const checkout = await this.row(user, id);
     const provider = input.provider, method = input.method;
     if (!['moniepoint', 'squad'].includes(provider) || !['card', 'transfer'].includes(method) || (provider === 'squad' && method !== 'transfer')) throw new BadRequestException('Choose a supported payment provider and method');
     const clientId = String(input.clientAttemptId || '').trim();
@@ -393,7 +395,10 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     }
     const snap = row.snapshot;
     const now = new Date();
+    const originHub = await this.model('Hub').findById(row.hub).lean();
+    const originDevice = await this.model('PosDevice').findOne({ device_id: row.device_id, hub: row.hub }).lean();
     row.receipt = {
+      origin: { storeName: originHub?.hub_name, deviceLabel: originDevice?.label },
       id: row.client_sale_id, deviceId: row.device_id, storeId: String(row.hub), hubId: String(row.hub), cashierId: String(row.cashier), cashierName: row.cashier_name,
       customerId: String(row.customer), customerName: row.customer_name, shiftId: row.sale_payload.shiftId,
       kind: row.kind, paymentMode: row.mode, creditBalanceKobo: row.credit_kobo, dueDate: row.due_date, creditId: row.credit ? String(row.credit) : undefined,
