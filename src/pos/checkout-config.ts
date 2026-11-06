@@ -1,4 +1,4 @@
-export type MoniepointAccount = { businessId: string; businessOwnerId: string; apiKeyEnv: string; webhookSecretEnv: string };
+export type MoniepointAccount = { businessId: string; businessOwnerId: string; apiKeyEnv: string; webhookSecretEnv: string; clientIdEnv?: string };
 export type TerminalMapping = { hubId: string; accountKey: string; terminalSerial: string };
 
 function objectEnv<T>(name: string): Record<string, T> {
@@ -19,6 +19,7 @@ export function checkoutConfiguration() {
     for (const field of ['apiKeyEnv', 'webhookSecretEnv']) {
       if (!/^[A-Z][A-Z0-9_]*$/.test(account[field]) || !process.env[account[field]]) errors.push(`Missing credential: ${key}.${field}`);
     }
+    if (account.clientIdEnv != null && (typeof account.clientIdEnv !== 'string' || !/^[A-Z][A-Z0-9_]*$/.test(account.clientIdEnv) || !process.env[account.clientIdEnv])) errors.push(`Missing credential: ${key}.clientIdEnv`);
   }
   const assigned = new Set<string>();
   for (const [device, mapping] of Object.entries(terminals)) {

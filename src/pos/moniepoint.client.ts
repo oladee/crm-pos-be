@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'crypto';
+import { createHash, createHmac, timingSafeEqual } from 'crypto';
 import { ProviderFailure } from './payment-provider';
 import { MoniepointAccount, settingMilliseconds } from './checkout-config';
 import { auditedPspFetch, type AuditHttp } from './psp-audit';
@@ -19,18 +19,58 @@ function outcome(row: any, polling: boolean): TerminalEvidence['status'] {
 }
 
 export class MoniepointClient {
+  private static readonly tokens = new Map<string, { token?: string; expiresAt: number; pending?: Promise<string> }>();
   constructor(private readonly account: MoniepointAccount, private readonly baseUrl: string, private readonly audit?: AuditHttp) {}
 
+  private async bearer(): Promise<string> {
+    const secret = process.env[this.account.apiKeyEnv] || '';
+    if (!this.account.clientIdEnv) return secret;
+    const clientId = process.env[this.account.clientIdEnv];
+    if (!clientId || !secret) throw new ProviderFailure('Moniepoint client credentials are missing. No payment request was sent.', true);
+    const key = createHash('sha256').update(JSON.stringify([this.baseUrl, clientId, secret])).digest('hex');
+    const cached = MoniepointClient.tokens.get(key);
+    if (cached?.pending) return cached.pending;
+    if (cached?.token && cached.expiresAt > Date.now()) return cached.token;
+    const entry: { token?: string; expiresAt: number; pending?: Promise<string> } = { expiresAt: 0 };
+    entry.pending = (async () => {
+      try {
+        const audit = this.audit ? { context: this.audit.context, write: (row: Record<string, unknown>) => this.audit!.write({ ...row, operation: 'authentication' }) } : undefined;
+        const response = await auditedPspFetch(`${this.baseUrl}/v1/auth`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, redirect: 'error',
+          body: JSON.stringify({ clientId, clientSecret: secret }),
+          signal: AbortSignal.timeout(settingMilliseconds('MONIEPOINT_HTTP_TIMEOUT_MS', 10_000)),
+        }, audit);
+        const body = await response.json().catch(() => null);
+        if (!response.ok || typeof body?.accessToken !== 'string' || !body.accessToken || /\s/.test(body.accessToken)
+          || typeof body.expiresIn !== 'number' || !Number.isFinite(body.expiresIn) || body.expiresIn <= 0) throw new Error('Authentication failed');
+        entry.token = body.accessToken;
+        entry.expiresAt = Date.now() + Math.max(0, body.expiresIn * 1000 - Math.min(30_000, body.expiresIn * 100));
+        return entry.token!;
+      } catch {
+        MoniepointClient.tokens.delete(key);
+        // Authentication cannot create a charge: the payment HTTP request has not started.
+        throw new ProviderFailure('Moniepoint authentication failed. No payment request was sent.', true);
+      } finally { entry.pending = undefined; }
+    })();
+    if (MoniepointClient.tokens.size >= 128) MoniepointClient.tokens.delete(MoniepointClient.tokens.keys().next().value!);
+    MoniepointClient.tokens.set(key, entry);
+    return entry.pending;
+  }
+
   private async request(path: string, body?: unknown) {
+    const bearer = await this.bearer();
     let response: Response;
     try {
       response = await auditedPspFetch(`${this.baseUrl}${path}`, {
-        method: body ? 'POST' : 'GET', headers: { Authorization: `Bearer ${process.env[this.account.apiKeyEnv] || ''}`, 'Content-Type': 'application/json' },
+        method: body ? 'POST' : 'GET', headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' }, redirect: 'error',
         body: body ? JSON.stringify(body) : undefined,
         signal: AbortSignal.timeout(settingMilliseconds('MONIEPOINT_HTTP_TIMEOUT_MS', 10_000)),
       }, this.audit);
     } catch (error) { if (error instanceof ProviderFailure) throw error; throw new ProviderFailure('Moniepoint result is unknown. Check the existing payment before retrying.', false); }
     const data = await response.json().catch(() => null);
+    if (response.status === 401 && this.account.clientIdEnv) {
+      for (const [key, entry] of MoniepointClient.tokens) if (entry.token === bearer) MoniepointClient.tokens.delete(key);
+    }
     if (!response.ok) throw new ProviderFailure('Moniepoint could not accept or retrieve the payment.', [401, 403, 422].includes(response.status));
     return data;
   }
