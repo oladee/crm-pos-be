@@ -71,7 +71,7 @@ export class PosPasskeyService {
     const sequence = await this.sequenceModel.findOneAndUpdate(
       { _id: hub },
       [{ $set: { value: { $add: [{ $max: [{ $ifNull: ['$value', 0] }, highest] }, 1] } } }],
-      { upsert: true, new: true, updatePipeline: true },
+      { upsert: true, returnDocument: 'after', updatePipeline: true },
     );
     return `Till ${sequence!.value}`;
   }
@@ -126,7 +126,7 @@ export class PosPasskeyService {
     const row = await this.codeModel.findOneAndUpdate(
       { code_hash: this.hashCode(code), used_at: null, expires_at: { $gt: now } },
       { $set: { used_at: now } },
-      { new: true },
+      { returnDocument: 'after' },
     );
     if (!row) throw new ForbiddenException('That registration code is not valid');
     return row;
@@ -220,7 +220,7 @@ export class PosPasskeyService {
       credential_backed_up: verification.registrationInfo.credentialBackedUp,
     };
     const doc = existing
-      ? await this.deviceModel.findOneAndUpdate({ device_id: id }, { $set: fields }, { new: true })
+      ? await this.deviceModel.findOneAndUpdate({ device_id: id }, { $set: fields }, { returnDocument: 'after' })
       : await this.deviceModel.create({ device_id: id, bound_at: now, ...fields });
     // Assertions started for the old credential cannot survive re-enrollment.
     await this.challengeModel.deleteMany({ device_id: id, kind: 'authentication' });

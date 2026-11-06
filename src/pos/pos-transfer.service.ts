@@ -100,7 +100,7 @@ export class PosTransferService {
   }
 
   private async lock(clientSaleId: string) {
-    const row = await this.transfers.findOneAndUpdate({ client_sale_id: clientSaleId }, { $inc: { __v: 1 } }, { new: true });
+    const row = await this.transfers.findOneAndUpdate({ client_sale_id: clientSaleId }, { $inc: { __v: 1 } }, { returnDocument: 'after' });
     if (!row) throw new NotFoundException('Transfer not found');
     return row;
   }

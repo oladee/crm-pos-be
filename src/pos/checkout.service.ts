@@ -88,7 +88,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async lock(id: any) {
-    const row = await this.model('PosCheckout').findOneAndUpdate({ _id: id }, { $inc: { __v: 1 } }, { new: true });
+    const row = await this.model('PosCheckout').findOneAndUpdate({ _id: id }, { $inc: { __v: 1 } }, { returnDocument: 'after' });
     if (!row) throw new NotFoundException('Checkout not found');
     return row;
   }
@@ -218,7 +218,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
 
   private async dispatch(attempt: any) {
     const claimed = await this.model('PosPaymentAttempt').findOneAndUpdate({ _id: attempt._id, status: 'queued' },
-      { $set: { status: 'pending', lease_owner: this.worker, lease_until: new Date(Date.now() + 90_000), next_check: new Date(Date.now() + 15_000) } }, { new: true });
+      { $set: { status: 'pending', lease_owner: this.worker, lease_until: new Date(Date.now() + 90_000), next_check: new Date(Date.now() + 15_000) } }, { returnDocument: 'after' });
     if (!claimed) return;
     try {
       if (claimed.provider === 'moniepoint') {
@@ -285,7 +285,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     if (attempt.status === 'queued') return this.dispatch(attempt);
     const claimed = await this.model('PosPaymentAttempt').findOneAndUpdate({ _id: attempt._id, status: { $in: ACTIVE },
       $or: [{ lease_until: { $exists: false } }, { lease_until: { $lt: new Date() } }] },
-      { $set: { lease_owner: this.worker, lease_until: new Date(Date.now() + 90_000) } }, { new: true });
+      { $set: { lease_owner: this.worker, lease_until: new Date(Date.now() + 90_000) } }, { returnDocument: 'after' });
     if (!claimed) return;
     try {
       let event: any;
@@ -400,7 +400,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
       row.reservation_state = 'consumed';
     } else {
       // Write fence serializes with CRM's transaction-backed repayment path.
-      const credit = await this.model('CreditRecord').findOneAndUpdate({ _id: row.credit }, { $inc: { __v: 1 } }, { new: true });
+      const credit = await this.model('CreditRecord').findOneAndUpdate({ _id: row.credit }, { $inc: { __v: 1 } }, { returnDocument: 'after' });
       if (!credit || ['Clear', 'Voided'].includes(credit.status) || kobo(credit.amount_owed) < row.due_kobo) throw new ConflictException('Outstanding credit changed; reconcile this payment');
       const balance = kobo(credit.amount_owed) - row.due_kobo;
       credit.amount_owed = balance / 100; credit.status = creditStatus(balance, credit.due_date); credit.last_payment_date = new Date();
@@ -462,7 +462,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
       for (let i = 0; i < 10; i++) {
         const event = await this.model('PosWebhookInbox').findOneAndUpdate({ state: 'pending',
           $or: [{ lease_until: { $exists: false } }, { lease_until: { $lt: new Date() } }] },
-          { $set: { lease_owner: this.worker, lease_until: new Date(Date.now() + 90_000) } }, { new: true });
+          { $set: { lease_owner: this.worker, lease_until: new Date(Date.now() + 90_000) } }, { returnDocument: 'after' });
         if (!event) break;
         try {
           const attempt = await this.model('PosPaymentAttempt').findOne({ provider: event.provider, account_key: event.account_key, merchant_reference: event.evidence.reference });

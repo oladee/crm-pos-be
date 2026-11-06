@@ -1186,7 +1186,7 @@ export class PosService {
     let creditBalanceKobo: number | undefined, refundPaidKobo: number | undefined;
     if ((original as any).credit_record) {
       const credits = this.productModel.db.model('CreditRecord');
-      const credit = await credits.findOneAndUpdate({ _id: (original as any).credit_record }, { $inc: { __v: 1 } }, { new: true });
+      const credit = await credits.findOneAndUpdate({ _id: (original as any).credit_record }, { $inc: { __v: 1 } }, { returnDocument: 'after' });
       if (!credit || credit.status === 'Voided') throw new ConflictException('Credit needs reconciliation in CRM');
       const previous = await this.saleModel.find({ reversal_of: originalClientId }).lean();
       const netKobo = Math.round((original.amount + previous.reduce((sum, sale) => sum + sale.amount, 0) - Math.abs(amount)) * 100);
@@ -1285,7 +1285,7 @@ export class PosService {
           note: payload.note,
         },
       },
-      { upsert: true, new: true },
+      { upsert: true, returnDocument: 'after' },
     );
     return { data: doc };
   }
@@ -1328,7 +1328,7 @@ export class PosService {
           action: payload.action,
         },
       },
-      { upsert: true, new: true },
+      { upsert: true, returnDocument: 'after' },
     );
     return { data: doc };
   }
@@ -1374,7 +1374,7 @@ export class PosService {
           variances,
         },
       },
-      { upsert: true, new: true },
+      { upsert: true, returnDocument: 'after' },
     );
     return { data: { ...doc.toObject?.() ?? doc, expected, variances } };
   }
