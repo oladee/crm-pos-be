@@ -82,7 +82,9 @@ describe('payment reservations with real MongoDB transactions', () => {
       await products.updateOne({ _id: product }, { $set: { unit_of_measure: 'Cartons', carton_weight: 5, carton_price: 500 } });
       await logs.updateMany({ item: product }, { $set: { carton_weight: 5, carton_price: 500 } });
     });
-    const request = payload('carton', 1); request.lines[0].saleUnit = 'Carton';
+    const request = payload('carton', 1);
+    request.lines[0].saleUnit = 'Carton';
+    request.lines[0].saleWeightKg = 5;
     await service.start(actor, request);
     expect((await products.findById(product)).reserved_stock).toBe(1);
   });

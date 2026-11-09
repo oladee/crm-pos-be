@@ -67,6 +67,7 @@ const SaleItemSchema = new Schema(
     unit: String,
     sale_unit: String,
     stock_quantity: Number,
+    sale_weight_kg: Number,
     category: String,
     batch_number: String,
     unit_cost: Number,

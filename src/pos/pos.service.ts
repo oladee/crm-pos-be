@@ -129,7 +129,15 @@ type SaleLineIn = {
   batch_number?: string;
   saleUnit?: string;
   sale_unit?: string;
+  saleWeightKg?: number;
+  sale_weight_kg?: number;
 };
+
+function isHalfCartonMultiple(quantity: number): boolean {
+  if (!(quantity > 0) || !Number.isFinite(quantity)) return false;
+  const doubled = quantity * 2;
+  return Math.abs(doubled - Math.round(doubled)) < 1e-6;
+}
 
 function oid(id: string, label = 'id') {
   if (!Types.ObjectId.isValid(id)) throw new BadRequestException(`Invalid ${label}`);
@@ -671,6 +679,7 @@ export class PosService {
       saleUnit: string;
       quantity: number;
       stockQuantity: number;
+      saleWeightKg?: number;
       unitPriceKobo: number;
       unitCostKobo: number;
       discountKobo: number;
@@ -701,10 +710,24 @@ export class PosService {
       }
       const qty = this.lineQty(line);
       if (qty <= 0) throw new BadRequestException(`Quantity is required for ${product.name}`);
+      const saleWeightKg = Number(line.saleWeightKg ?? line.sale_weight_kg);
       let stockQuantity = qty;
+      let lineSaleWeightKg: number | undefined;
       if (carton && saleUnit === 'Kg') {
         if (!(Number(product.carton_weight) > 0)) throw new BadRequestException('Set the SKU carton weight before selling by Kg');
         stockQuantity = qty / Number(product.carton_weight);
+      } else if (carton && saleUnit === 'Carton') {
+        if (!isHalfCartonMultiple(qty)) {
+          throw new BadRequestException(`Carton quantity for ${product.name} must be a multiple of 0.5`);
+        }
+        if (!(saleWeightKg > 0)) {
+          throw new BadRequestException(`Weighed kg is required for Carton sales of ${product.name}`);
+        }
+        if (!(Number(product.carton_weight) > 0)) {
+          throw new BadRequestException(`Set the SKU carton weight before selling ${product.name} by Carton`);
+        }
+        stockQuantity = saleWeightKg / Number(product.carton_weight);
+        lineSaleWeightKg = saleWeightKg;
       }
       const already = usedStock.get(String(product._id)) || 0;
       if (Number(product.current_stock || 0) - Number(product.reserved_stock || 0) - already + 1e-9 < stockQuantity) throw new BadRequestException('Insufficient available stock for ' + product.name);
@@ -730,8 +753,21 @@ export class PosService {
         const allocation = allocations[index];
         const allocatedDiscount = index === allocations.length - 1 ? discountKobo - assignedDiscount : Math.round(discountKobo * allocation.quantity / stockQuantity);
         assignedDiscount += allocatedDiscount;
-        priced.push({ product, batchNumber: allocation.batch_number, saleUnit, quantity: qty * allocation.quantity / stockQuantity,
-          stockQuantity: allocation.quantity, unitPriceKobo, unitCostKobo: allocation.unit_cost, discountKobo: allocatedDiscount, name: product.name });
+        priced.push({
+          product,
+          batchNumber: allocation.batch_number,
+          saleUnit,
+          quantity: qty * allocation.quantity / stockQuantity,
+          stockQuantity: allocation.quantity,
+          saleWeightKg:
+            lineSaleWeightKg != null
+              ? lineSaleWeightKg * allocation.quantity / stockQuantity
+              : undefined,
+          unitPriceKobo,
+          unitCostKobo: allocation.unit_cost,
+          discountKobo: allocatedDiscount,
+          name: product.name,
+        });
       }
     }
     const afterLines = subtotal - lineDiscount;
@@ -1061,6 +1097,7 @@ export class PosService {
       unit: line.saleUnit,
       sale_unit: line.saleUnit,
       stock_quantity: line.stockQuantity,
+      sale_weight_kg: line.saleWeightKg,
       category: line.product.category,
       batch_number: line.batchNumber,
       unit_cost: koboToNaira(line.unitCostKobo),
