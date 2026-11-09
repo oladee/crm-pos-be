@@ -79,14 +79,15 @@ describe('payment reservations with real MongoDB transactions', () => {
   });
   it('converts carton quantities into stock units before reserving', async () => {
     await db.transaction(async () => {
-      await products.updateOne({ _id: product }, { $set: { unit_of_measure: 'Cartons', carton_weight: 5, carton_price: 500 } });
-      await logs.updateMany({ item: product }, { $set: { carton_weight: 5, carton_price: 500 } });
+      await products.updateOne({ _id: product }, { $set: { unit_of_measure: 'Cartons', carton_weight: 10, carton_price: 500 } });
+      await logs.updateMany({ item: product }, { $set: { carton_weight: 10, carton_price: 500 } });
     });
     const request = payload('carton', 1);
     request.lines[0].saleUnit = 'Carton';
-    request.lines[0].saleWeightKg = 5;
+    // Weighed 9kg against registered 10kg → reserve 0.9 cartons (not qty).
+    request.lines[0].saleWeightKg = 9;
     await service.start(actor, request);
-    expect((await products.findById(product)).reserved_stock).toBe(1);
+    expect((await products.findById(product)).reserved_stock).toBeCloseTo(0.9);
   });
   it('blocks CRM stock reductions and reserved-batch consumption on another connection', async () => {
     await service.start(actor, payload('crm', 8));

@@ -349,6 +349,7 @@ export class TransactionsService {
             lineTotal:
               Math.round(line.quantity * line.unitPriceKobo) -
               line.discountKobo,
+            saleWeightKg: line.saleWeightKg,
           })),
           receiptPayment: {
             provider: row.provider || 'bachs',
@@ -371,6 +372,10 @@ export class TransactionsService {
           unitPrice: cents(line.unit_price),
           discount: 0,
           lineTotal: Math.round(Number(line.quantity) * cents(line.unit_price)),
+          saleWeightKg:
+            line.sale_weight_kg != null
+              ? Number(line.sale_weight_kg)
+              : undefined,
         }));
         const total = cents(row.amount),
           paid = cents(row.amount_paid);
