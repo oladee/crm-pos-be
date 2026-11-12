@@ -22,6 +22,7 @@ export const PosPaymentAttemptSchema = new Schema({
   client_attempt_id: { type: String, required: true }, merchant_reference: { type: String, required: true, unique: true },
   provider: { type: String, enum: ['moniepoint', 'squad'], required: true }, method: String,
   account_key: String, account_snapshot: Schema.Types.Mixed, terminal_serial: String, terminal_lock: String,
+  dispatch_actor: Schema.Types.ObjectId, dispatch_role: String, dispatch_device: String,
   status: { type: String, enum: ['queued', 'pending', 'unknown', 'paid', 'failed', 'review'], default: 'queued' },
   amount_kobo: Number, payable_kobo: Number, fee_kobo: Number, instructions: Schema.Types.Mixed,
   review_reason: String, failures: { type: Number, default: 0 }, next_check: Date,

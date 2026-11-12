@@ -11,7 +11,8 @@ describe('customer checkout and payment recovery', () => {
   let replica, app, db, service, base, provider, providerBase, token, managerToken;
   const hub = new Types.ObjectId(), cashier = new Types.ObjectId(), manager = new Types.ObjectId(), customer = new Types.ObjectId(), product = new Types.ObjectId();
   const requests = new Map();
-  let nextBehavior = 'normal', pushCalls = 0;
+  let nextBehavior = 'normal', pushCalls = 0, squadPushCalls = 0;
+  const lookups = [];
   const actor = { sub: String(cashier), role: 'cashier', hubId: String(hub), deviceId: 'till-1' };
   const draft = (id, overrides = {}) => ({ clientSaleId: id, customerId: String(customer), paymentMode: 'full_payment',
     lines: [{ productId: String(product), qty: 2, saleUnit: 'Units', discount: 0 }], ...overrides });
@@ -79,18 +80,21 @@ describe('customer checkout and payment recovery', () => {
       }
       if (path.startsWith('/v1/transactions/merchants/')) {
         const ref = decodeURIComponent(path.split('/').pop()), row = requests.get(ref);
+        lookups.push(ref);
         if (!row) return json({}, 404);
         return json({ merchantReference: ref, businessOwnerId: 101, terminalSerial: row.terminalSerial,
           processingStatus: row.paid ? 'PROCESSED' : 'PENDING', responseCode: row.paid ? '20000' : null,
           actualAmount: row.paid ? row.amount : null, transactionReference: row.paid ? `txn-${ref}` : '', actualPaymentMethod: row.paymentMethod });
       }
       if (path === '/virtual-account/initiate-dynamic-virtual-account') {
-        const body = JSON.parse(raw); requests.set(body.transaction_ref, { amount: body.amount, paid: false });
+        const body = JSON.parse(raw); squadPushCalls++; requests.set(body.transaction_ref, { amount: body.amount, paid: false });
+        if (nextBehavior === 'lost-response') { nextBehavior = 'normal'; res.destroy(); return; }
         return json({ success: true, data: { transaction_reference: body.transaction_ref, expected_amount: (body.amount + 100) / 100,
           currency: 'NGN', account_number: '0123456789', bank: 'Test Bank', account_name: 'Lagos Store' } });
       }
       if (path.startsWith('/virtual-account/get-dynamic-virtual-account-transactions/')) {
         const ref = decodeURIComponent(path.split('/').pop()), row = requests.get(ref);
+        lookups.push(ref);
         return json({ success: true, data: { rows: row?.paid ? [{ transaction_status: 'SUCCESS', merchant_reference: ref,
           transaction_reference: `squad-txn-${ref}`, amount_received: (row.amount + 100) / 100, currency: 'NGN' }] : [] } });
       }
@@ -110,7 +114,7 @@ describe('customer checkout and payment recovery', () => {
   after(async () => { await app?.close(); await replica?.stop(); if (provider) await new Promise(resolve => provider.close(resolve)); });
   beforeEach(async () => {
     for (const model of Object.values(db.models)) await model.collection.deleteMany({});
-    requests.clear(); pushCalls = 0; nextBehavior = 'normal'; process.env.MONIEPOINT_HTTP_TIMEOUT_MS = '1000'; process.env.MONIEPOINT_ENABLED = 'true';
+    requests.clear(); lookups.length = 0; pushCalls = 0; squadPushCalls = 0; nextBehavior = 'normal'; process.env.MONIEPOINT_HTTP_TIMEOUT_MS = '1000'; process.env.MONIEPOINT_ENABLED = 'true';
     const cashierRole = await db.model('Role').create({ name: 'cashier' }), managerRole = await db.model('Role').create({ name: 'hub_manager' });
     await db.model('Hub').create({ _id: hub, hub_name: 'Lagos', hub_manager: manager, is_active: true });
     await db.model('User').create([{ _id: cashier, full_name: 'Cashier', email: 'cashier@example.test', hub, role: cashierRole._id }, { _id: manager, full_name: 'Manager', hub, role: managerRole._id }]);
@@ -407,7 +411,118 @@ describe('customer checkout and payment recovery', () => {
     }
   });
 
-  it('recovers verified webhooks and scheduled checks through BullMQ', {
+  it('suppresses an unsent queued request after manual completion and holds its lock until then', async () => {
+    process.env.POS_PAYMENT_RECONCILIATION_MODE = 'bullmq';
+    process.env.POS_PAYMENT_DISPATCH_MODE = 'bullmq';
+    try {
+      const row = await create('queued-no-redis');
+      const [left, right] = await Promise.all([attempt(row), attempt(row)]);
+      const queued = left.attempts[0];
+      assert.equal(queued.status, 'queued');
+      assert.equal(right.attempts[0].reference, queued.reference);
+      assert.equal(pushCalls, 0);
+      assert.equal(await db.model('PosPaymentAttempt').countDocuments(), 1);
+      const other = await create('queued-terminal-contention');
+      const denied = await api(`/checkouts/${other.id}/payment-attempts`, { provider: 'moniepoint', method: 'card', clientAttemptId: 'other' });
+      assert.equal(denied.status, 409);
+      assert.equal((await api(`/checkouts/${row.id}?refresh=1`)).data.attempts[0].status, 'queued');
+      assert.equal((await manual(row, { attemptId: queued.id })).status, 400);
+      assert.equal((await manual(row)).status, 201);
+      assert.equal(await db.model('PosTerminalLock').countDocuments(), 0);
+      const stale = await db.model('PosPaymentAttempt').findById(queued.id).lean();
+      assert.equal(stale.status, 'failed');
+      assert.equal(await service.poll({ ...stale, status: 'queued' }, queued.id), 'stale');
+      assert.equal(pushCalls, 0);
+      assert.equal(await db.model('Sale').countDocuments(), 1);
+      const disabled = (await attempt(other)).attempts[0];
+      process.env.MONIEPOINT_ENABLED = 'false';
+      await service.poll(await db.model('PosPaymentAttempt').findById(disabled.id), disabled.id);
+      assert.equal((await db.model('PosPaymentAttempt').findById(disabled.id)).status, 'failed');
+      assert.equal(await db.model('PosTerminalLock').countDocuments(), 0);
+      assert.equal(pushCalls, 0);
+    } finally {
+      process.env.POS_PAYMENT_RECONCILIATION_MODE = 'legacy';
+      delete process.env.POS_PAYMENT_DISPATCH_MODE;
+    }
+  });
+
+  it('revalidates queued Moniepoint enrollment and mapping and safely cancels an unsent attempt', async () => {
+    process.env.POS_PAYMENT_RECONCILIATION_MODE = 'bullmq';
+    process.env.POS_PAYMENT_DISPATCH_MODE = 'bullmq';
+    const terminals = process.env.MONIEPOINT_TERMINALS_JSON;
+    const accounts = process.env.MONIEPOINT_ACCOUNTS_JSON;
+    try {
+      const row = await create('queued-revalidate');
+      const attempts = db.model('PosPaymentAttempt');
+      const devices = db.model('PosDevice');
+      const locks = db.model('PosTerminalLock');
+      const run = async (id, mutation, restore, expected) => {
+        const queued = (await attempt(row, id)).attempts.at(-1);
+        assert.equal(await locks.countDocuments(), 1);
+        await mutation();
+        await service.poll(await attempts.findById(queued.id), queued.id);
+        await restore();
+        const failed = await attempts.findById(queued.id);
+        assert.equal(failed.status, 'failed');
+        assert.match(failed.review_reason, expected);
+        assert.equal(await locks.countDocuments(), 0);
+        assert.equal(pushCalls, 0);
+      };
+      await run('till-revoked',
+        () => devices.updateOne({ device_id: 'till-1' }, { $set: { revoked: true } }),
+        () => devices.updateOne({ device_id: 'till-1' }, { $set: { revoked: false } }),
+        /assignment changed/);
+      await run('staff-inactive',
+        () => db.model('User').updateOne({ _id: cashier }, { $set: { is_active: false } }),
+        () => db.model('User').updateOne({ _id: cashier }, { $set: { is_active: true } }),
+        /assignment changed/);
+      await run('hub-inactive',
+        () => db.model('Hub').updateOne({ _id: hub }, { $set: { is_active: false } }),
+        () => db.model('Hub').updateOne({ _id: hub }, { $set: { is_active: true } }),
+        /assignment changed/);
+      await run('terminal-remapped',
+        () => { const next = JSON.parse(terminals); next['till-1'].terminalSerial = 'SERIAL-2'; process.env.MONIEPOINT_TERMINALS_JSON = JSON.stringify(next); },
+        () => { process.env.MONIEPOINT_TERMINALS_JSON = terminals; },
+        /terminal assignment changed/);
+      await run('business-remapped',
+        () => { const next = JSON.parse(accounts); next.lagos.businessId = '200'; process.env.MONIEPOINT_ACCOUNTS_JSON = JSON.stringify(next); },
+        () => { process.env.MONIEPOINT_ACCOUNTS_JSON = accounts; },
+        /account or terminal assignment changed/);
+      const queued = (await attempt(row, 'cancel-before-send')).attempts.at(-1);
+      const snapshot = await attempts.findById(queued.id);
+      const response = await api(`/checkouts/${row.id}/cancel`, {});
+      assert.equal(response.status, 201);
+      assert.equal(response.data.status, 'cancelled');
+      assert.equal((await db.model('PosCheckout').findById(row.id)).reservation_state, 'released');
+      assert.equal(await service.poll(snapshot, queued.id), 'stale');
+      assert.equal(await locks.countDocuments(), 0);
+      assert.equal(pushCalls, 0);
+      assert.equal(await db.model('Sale').countDocuments(), 0);
+
+      const racing = await create('queued-cancel-race');
+      const racingAttempt = (await attempt(racing, 'race')).attempts[0];
+      const racingSnapshot = await attempts.findById(racingAttempt.id);
+      const [cancelResult] = await Promise.all([
+        api(`/checkouts/${racing.id}/cancel`, {}),
+        service.poll(racingSnapshot, racingAttempt.id),
+      ]);
+      if (cancelResult.status === 201) {
+        assert.equal(pushCalls, 0);
+        assert.equal(await locks.countDocuments(), 0);
+      } else {
+        assert.equal(cancelResult.status, 409);
+        assert.equal(pushCalls, 1);
+        assert.equal(await locks.countDocuments(), 1);
+      }
+    } finally {
+      process.env.MONIEPOINT_TERMINALS_JSON = terminals;
+      process.env.MONIEPOINT_ACCOUNTS_JSON = accounts;
+      process.env.POS_PAYMENT_RECONCILIATION_MODE = 'legacy';
+      delete process.env.POS_PAYMENT_DISPATCH_MODE;
+    }
+  });
+
+  it('recovers verified webhooks, scheduled checks and outbound attempts through BullMQ', {
     skip: !process.env.EVENT_TEST_REDIS_BINARY && 'set EVENT_TEST_REDIS_BINARY for real BullMQ coverage',
     timeout: 60_000,
   }, async () => {
@@ -525,6 +640,54 @@ describe('customer checkout and payment recovery', () => {
       assert.ok(trace.some(line => line.action === 'payment_reconciliation_failed'));
       assert.ok(trace.some(line => line.action === 'payment_reconciliation_done'));
       assert.ok(!logs.join('\n').includes(secret));
+
+      process.env.POS_PAYMENT_DISPATCH_MODE = 'bullmq';
+      await worker.close(); worker = undefined;
+      const pendingPush = await create('outbound-queued-moniepoint');
+      const priorPushes = pushCalls;
+      const queued = (await attempt(pendingPush)).attempts[0];
+      assert.equal(queued.status, 'queued');
+      assert.equal(pushCalls, priorPushes);
+      const queuedRecord = await attempts.findById(queued.id);
+      const dispatchJobId = `payment.status.check.v1-${queued.id}-${queuedRecord.next_check.getTime()}`;
+      await relay.dispatch();
+      assert.deepEqual((await jobs.getJob(dispatchJobId)).data, { recordId: queued.id });
+      await jobs.obliterate({ force: true });
+      assert.equal(await jobs.getJob(dispatchJobId), undefined);
+      relay = new PaymentReconciliationRelay(db, jobs);
+      await relay.dispatch();
+      assert.ok(await jobs.getJob(dispatchJobId));
+      process.env.POS_PAYMENT_DISPATCH_MODE = 'inline'; // Existing work remains recoverable after rollback.
+      nextBehavior = 'server-error';
+      await startWorker();
+      await waitFor(async () => (await attempts.findById(queued.id)).status === 'unknown');
+      assert.equal(pushCalls, priorPushes + 1);
+      assert.equal(await db.model('PosTerminalLock').countDocuments(), 1);
+      await attempt(pendingPush);
+      assert.equal(pushCalls, priorPushes + 1);
+      requests.get(queued.reference).paid = true;
+      await attempts.updateOne({ _id: queued.id }, { $set: { next_check: new Date() } });
+      await relay.dispatch();
+      await waitFor(async () => (await db.model('PosCheckout').findById(pendingPush.id)).status === 'completed');
+      assert.ok(lookups.includes(queued.reference));
+      assert.equal(pushCalls, priorPushes + 1);
+      assert.equal(await db.model('PosTerminalLock').countDocuments(), 0);
+
+      process.env.POS_PAYMENT_DISPATCH_MODE = 'bullmq';
+      const pendingSquad = await create('outbound-queued-squad');
+      const priorSquadPushes = squadPushCalls;
+      const squadQueued = (await attempt(pendingSquad, 'queued-squad', 'squad')).attempts[0];
+      assert.equal(squadQueued.status, 'queued');
+      assert.equal(squadPushCalls, priorSquadPushes);
+      nextBehavior = 'lost-response';
+      await relay.dispatch();
+      await waitFor(async () => (await attempts.findById(squadQueued.id)).status === 'unknown');
+      await attempts.updateOne({ _id: squadQueued.id }, { $set: { next_check: new Date() } });
+      await relay.dispatch();
+      await waitFor(() => lookups.includes(squadQueued.reference));
+      assert.equal(squadPushCalls, priorSquadPushes + 1);
+      assert.equal((await db.model('PosCheckout').findById(pendingSquad.id)).reservation_state, 'held');
+      assert.equal(await db.model('Sale').countDocuments(), 4);
     } finally {
       inbox.updateOne = originalUpdate;
       if (worker) await worker.close();
@@ -534,6 +697,7 @@ describe('customer checkout and payment recovery', () => {
         const exited = once(redisServer, 'exit'); redisServer.kill(); await exited;
       }
       process.env.POS_PAYMENT_RECONCILIATION_MODE = 'legacy';
+      delete process.env.POS_PAYMENT_DISPATCH_MODE;
       console.log = originalLog; console.error = originalError;
     }
   });

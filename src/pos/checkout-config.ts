@@ -44,3 +44,7 @@ export function settingMilliseconds(name: string, fallback: number) {
 export function bullmqReconciliationEnabled() {
   return process.env.POS_PAYMENT_RECONCILIATION_MODE === 'bullmq';
 }
+
+export function queuedPaymentDispatchEnabled() {
+  return bullmqReconciliationEnabled() && process.env.POS_PAYMENT_DISPATCH_MODE === 'bullmq';
+}

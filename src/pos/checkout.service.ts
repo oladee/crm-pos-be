@@ -4,7 +4,7 @@ import { Connection, Model, Types } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { PosService } from './pos.service';
 import { PosJwtPayload } from './pos-auth';
-import { bullmqReconciliationEnabled, checkoutConfiguration, settingMilliseconds } from './checkout-config';
+import { bullmqReconciliationEnabled, checkoutConfiguration, queuedPaymentDispatchEnabled, settingMilliseconds } from './checkout-config';
 import { MoniepointClient, TerminalEvidence } from './moniepoint.client';
 import { SquadClient } from './squad.client';
 import { ProviderFailure } from './payment-provider';
@@ -52,15 +52,15 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
   }
   onModuleDestroy() { if (this.timer) clearInterval(this.timer); }
 
-  async actor(user: PosJwtPayload, row?: any) {
-    const [staff, hub, device] = await Promise.all([
-      this.model('User').findById(user.sub).populate('role').lean(), this.model('Hub').findById(user.hubId).lean(),
-      this.model('PosDevice').findOne({ device_id: user.deviceId, hub: user.hubId, revoked: { $ne: true } }).lean(),
-    ]);
+  async actor(user: Omit<PosJwtPayload, 'role'> & { role?: PosJwtPayload['role'] }, row?: any) {
+    const staff = await this.model('User').findById(user.sub).populate('role').lean();
+    const hub = await this.model('Hub').findById(user.hubId).lean();
+    const device = await this.model('PosDevice').findOne({ device_id: user.deviceId, hub: user.hubId, revoked: { $ne: true } }).lean();
+    const role = user.role ?? (staff?.role?.name === 'hub_manager' ? 'manager' : 'cashier');
     if (!staff || staff.is_active === false || !hub || hub.is_active === false || !device ||
-      staff.role?.name !== (user.role === 'manager' ? 'hub_manager' : 'cashier') ||
-      (String(staff.hub) !== user.hubId && !(user.role === 'manager' && String(hub.hub_manager) === user.sub))) throw new ForbiddenException('Your till or location assignment is not active');
-    if (row && (String(row.hub) !== user.hubId || (user.role !== 'manager' && String(row.cashier) !== user.sub))) throw new ForbiddenException('This checkout is not assigned to you');
+      staff.role?.name !== (role === 'manager' ? 'hub_manager' : 'cashier') ||
+      (String(staff.hub) !== user.hubId && !(role === 'manager' && String(hub.hub_manager) === user.sub))) throw new ForbiddenException('Your till or location assignment is not active');
+    if (row && (String(row.hub) !== user.hubId || (role !== 'manager' && String(row.cashier) !== user.sub))) throw new ForbiddenException('This checkout is not assigned to you');
     return { staff, device };
   }
 
@@ -185,17 +185,19 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     if (!['moniepoint', 'squad'].includes(provider) || !['card', 'transfer'].includes(method) || (provider === 'squad' && method !== 'transfer')) throw new BadRequestException('Choose a supported payment provider and method');
     const clientId = String(input.clientAttemptId || '').trim();
     if (!clientId || clientId.length > 150) throw new BadRequestException('clientAttemptId is required');
-    const previous = await this.model('PosPaymentAttempt').findOne({ checkout: checkout._id, client_attempt_id: clientId });
-    if (previous) {
-      if (previous.provider !== provider || previous.method !== method) throw new ConflictException('This attempt ID belongs to another provider or method');
-      return this.view(checkout);
-    }
+    const findPrevious = async () => {
+      const previous = await this.model('PosPaymentAttempt').findOne({ checkout: checkout._id, client_attempt_id: clientId }).select('provider method').lean();
+      if (previous && (previous.provider !== provider || previous.method !== method)) throw new ConflictException('This attempt ID belongs to another provider or method');
+      return previous;
+    };
+    if (await findPrevious()) return this.view(await this.model('PosCheckout').findById(id));
     const options = await this.options(user);
     if (!options.methods.find(m => m.id === provider)?.available) throw new ServiceUnavailableException('This provider is not configured for this till');
     const config = checkoutConfiguration(), mapping = config.terminals[user.deviceId!];
-    await this.atomic(async () => {
+    const queuedDispatch = queuedPaymentDispatchEnabled();
+    const created = await this.atomic(async () => {
       const row = await this.lock(checkout._id);
-      if (await this.model('PosPaymentAttempt').exists({ checkout: row._id, client_attempt_id: clientId })) return;
+      if (await findPrevious()) return false;
       if (!['awaiting', 'review'].includes(row.status)) throw new ConflictException('Checkout is already closed');
       const active = await this.model('PosPaymentAttempt').exists({ checkout: row._id, status: { $in: ACTIVE } });
       if (active && input.acknowledgeDuplicateRisk !== true) throw new ConflictException('An earlier payment may still arrive. Confirm the duplicate-payment warning before switching.');
@@ -210,33 +212,55 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
         provider, method, account_key: provider === 'moniepoint' ? mapping.accountKey : 'squad',
         account_snapshot: provider === 'moniepoint' ? config.accounts[mapping.accountKey] : undefined,
         terminal_serial: terminalLock ? mapping.terminalSerial : undefined, terminal_lock: terminalLock,
+        dispatch_actor: user.sub, dispatch_role: user.role, dispatch_device: user.deviceId,
         amount_kobo: row.due_kobo, payable_kobo: provider === 'moniepoint' ? row.due_kobo : undefined,
-        fee_kobo: provider === 'moniepoint' ? 0 : undefined, status: 'queued', next_check: new Date(Date.now() + (bullmqReconciliationEnabled() ? 15_000 : 0)),
+        fee_kobo: provider === 'moniepoint' ? 0 : undefined, status: 'queued',
+        next_check: new Date(Date.now() + (bullmqReconciliationEnabled() && !queuedDispatch ? 15_000 : 0)),
       }]);
+      return true;
     }).catch(async error => {
-      if (error?.code === 11000 && await this.model('PosPaymentAttempt').exists({ checkout: checkout._id, client_attempt_id: clientId })) return;
+      if (error?.code === 11000 && await findPrevious()) return false;
       throw error;
     });
-    const attempt = await this.model('PosPaymentAttempt').findOne({ checkout: checkout._id, client_attempt_id: clientId });
-    if (attempt) await this.dispatch(attempt);
+    const attempt = created ? await this.model('PosPaymentAttempt').findOne({ checkout: checkout._id, client_attempt_id: clientId }) : null;
+    if (attempt && !queuedDispatch) await this.dispatch(attempt);
+    else if (attempt) eventLog('info', 'payment_dispatch_queued', {
+      queue: paymentReconciliationQueue, provider, attemptId: String(attempt._id),
+      correlationId: String(attempt._id), checkoutId: id, hubId: user.hubId,
+    });
     return this.view(await this.model('PosCheckout').findById(id));
   }
 
-  private async dispatch(attempt: any, scheduled = false) {
+  private async dispatch(attempt: any, correlationId?: string) {
     const owner = randomUUID();
-    const claimed = await this.model('PosPaymentAttempt').findOneAndUpdate({ _id: attempt._id, status: 'queued',
-      ...(scheduled ? { next_check: attempt.next_check ?? null, lease_until: attempt.lease_until ?? null } : {}) },
-      { $set: { status: 'pending', lease_owner: owner, lease_until: paymentLease(), next_check: new Date(Date.now() + 15_000) } }, { returnDocument: 'after' });
+    const claimed = await this.atomic(async () => {
+      const row = await this.lock(attempt.checkout);
+      if (['completed', 'cancelled'].includes(row.status)) {
+        await this.closeUnsentAttempts(row._id);
+        return null;
+      }
+      const filter = { _id: attempt._id, status: 'queued',
+        ...(correlationId != null ? { next_check: attempt.next_check ?? null, lease_until: attempt.lease_until ?? null } : {}) };
+      const queued = await this.model('PosPaymentAttempt').findOne(filter).lean();
+      if (!queued) return null;
+      const ineligible = await this.dispatchIneligibility(row, queued);
+      if (ineligible) {
+        await this.closeUnsentAttempt(queued, ineligible);
+        return null;
+      }
+      return this.model('PosPaymentAttempt').findOneAndUpdate(filter,
+        { $set: { status: 'pending', lease_owner: owner, lease_until: paymentLease(), next_check: new Date(Date.now() + 15_000) } }, { returnDocument: 'after' });
+    });
     if (!claimed) return 'stale';
     try {
       if (claimed.provider === 'moniepoint') {
-        await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl, this.auditHttp(await this.auditedAttempt(claimed))).open(claimed.merchant_reference, claimed.terminal_serial, claimed.amount_kobo, claimed.method);
+        await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl, this.auditHttp(await this.auditedAttempt(claimed, correlationId))).open(claimed.merchant_reference, claimed.terminal_serial, claimed.amount_kobo, claimed.method);
       } else {
         const row = await this.model('PosCheckout').findById(claimed.checkout);
         const staff = await this.model('User').findById(row.cashier).lean();
         const customer = await this.model('Customer').findById(row.customer).lean();
         const email = customer?.customer_email || customer?.email || staff?.email;
-        const opened = await this.squad(await this.auditedAttempt(claimed)).open({ clientSaleId: claimed.merchant_reference, amountKobo: claimed.amount_kobo, email });
+        const opened = await this.squad(await this.auditedAttempt(claimed, correlationId)).open({ clientSaleId: claimed.merchant_reference, amountKobo: claimed.amount_kobo, email });
         const instructions = { instructions: opened, payable_kobo: opened.payableKobo, fee_kobo: opened.payableKobo - claimed.amount_kobo };
         // This is verified evidence from the original request. It can fill missing
         // fees after a lease expires without changing reconciliation state.
@@ -261,6 +285,37 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
       await this.model('PosPaymentAttempt').updateOne({ _id: claimed._id, ...activeLease(owner) }, { $unset: { lease_owner: '', lease_until: '' } });
     }
     return 'dispatched';
+  }
+
+  private async dispatchIneligibility(row: any, attempt: any) {
+    const hubId = String(row.hub);
+    const deviceId = attempt.dispatch_device || row.device_id;
+    const actorId = String(attempt.dispatch_actor || row.cashier);
+    try {
+      await this.actor({ sub: actorId, role: attempt.dispatch_role, hubId, deviceId }, row);
+      if (actorId !== String(row.cashier) || deviceId !== row.device_id) {
+        await this.actor({ sub: String(row.cashier), hubId, deviceId: row.device_id }, row);
+      }
+    } catch (error) {
+      if (!(error instanceof ForbiddenException)) throw error;
+      return 'The till, staff or location assignment changed before this payment request was sent.';
+    }
+    if (attempt.provider === 'squad') {
+      return process.env.SQUAD_ENABLED === 'true' && process.env.SQUAD_DVA_APPROVED === 'true' &&
+        process.env.SQUAD_CONTRACT_VERIFIED === 'true' && process.env.SQUAD_SECRET_KEY
+        ? null : 'Squad was disabled or its configuration changed before this payment request was sent.';
+    }
+    const config = checkoutConfiguration();
+    const mapping = config.terminals[deviceId];
+    const account = mapping && config.accounts[mapping.accountKey];
+    const snapshot = attempt.account_snapshot;
+    if (process.env.MONIEPOINT_ENABLED !== 'true' || config.errors.length || mapping?.hubId !== hubId ||
+      mapping.terminalSerial !== attempt.terminal_serial || mapping.accountKey !== attempt.account_key ||
+      !account || !snapshot || account.businessId !== snapshot.businessId || account.businessOwnerId !== snapshot.businessOwnerId ||
+      account.apiKeyEnv !== snapshot.apiKeyEnv || account.clientIdEnv !== snapshot.clientIdEnv || account.webhookSecretEnv !== snapshot.webhookSecretEnv) {
+      return 'Moniepoint was disabled or its account or terminal assignment changed before this payment request was sent.';
+    }
+    return null;
   }
 
   private squad(attempt?: any) { return new SquadClient(process.env.SQUAD_SECRET_KEY || '', process.env.SQUAD_API_BASE_URL || undefined,
@@ -308,7 +363,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
 
   async poll(attempt: any, correlationId?: string) {
     const scheduled = correlationId != null;
-    if (attempt.status === 'queued') return this.dispatch(attempt, scheduled);
+    if (attempt.status === 'queued') return this.dispatch(attempt, correlationId);
     const owner = randomUUID();
     const claimed = await this.model('PosPaymentAttempt').findOneAndUpdate({ _id: attempt._id, status: { $in: ACTIVE },
       ...(scheduled ? { next_check: attempt.next_check ?? null, lease_until: attempt.lease_until ?? null } : {}),
@@ -422,7 +477,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
       if (input.attemptId) {
         if (!Types.ObjectId.isValid(input.attemptId)) throw new BadRequestException('Invalid payment attempt');
         attempt = await this.model('PosPaymentAttempt').findOne({ _id: input.attemptId, checkout: row._id });
-        if (!attempt || attempt.payable_kobo == null) throw new BadRequestException('Payment amount is not available; choose another account if money arrived elsewhere');
+        if (!attempt || attempt.status === 'queued' || attempt.payable_kobo == null) throw new BadRequestException('This attempt is not ready for confirmation; choose another account if money arrived elsewhere');
         const expectedMethod = attempt.method === 'card' ? 'Card' : 'Transfer';
         if (input.actualMethod !== expectedMethod) throw new BadRequestException('The received method does not match this attempt; choose another account');
       }
@@ -487,6 +542,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     };
     row.status = 'completed'; row.settled_attempt = attempt ? String(attempt._id) : undefined; row.confirmed_at = now; row.confirmation_source = source;
     await row.save();
+    await this.closeUnsentAttempts(row._id);
     if (row.due_kobo > 0 && (source === 'provider' || source === 'manual')) await saveLiveNotice(this.db, {
       sourceKey: `payment-confirmed:${row._id}`, audience: { kind: 'till', hubId: String(row.hub), tillId: row.device_id },
       kind: 'payment-confirmed', title: 'Payment confirmed', reference: row.client_sale_id,
@@ -499,11 +555,26 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
       const row = await this.lock(id);
       if (row.status === 'cancelled') return;
       if (row.status === 'completed') throw new ConflictException('Completed checkout cannot be cancelled');
-      if (await this.model('PosPaymentAttempt').exists({ checkout: row._id, status: { $in: [...ACTIVE, 'paid'] } })) throw new ConflictException('A payment may still arrive. Check the provider before cancelling.');
+      if (await this.model('PosPaymentAttempt').exists({ checkout: row._id, status: { $in: ['pending', 'unknown', 'review', 'paid'] } })) throw new ConflictException('A payment may still arrive. Check the provider before cancelling.');
+      await this.closeUnsentAttempts(row._id);
       if (row.reservation_state === 'held') { await this.pos.releasePayment(row.allocations); row.reservation_state = 'released'; }
       row.status = 'cancelled'; await row.save();
     });
     return this.view(await this.model('PosCheckout').findById(id));
+  }
+
+  private async closeUnsentAttempts(checkout: Types.ObjectId) {
+    const queued = await this.model('PosPaymentAttempt').find({ checkout, status: 'queued' }).select('_id terminal_lock');
+    for (const attempt of queued) {
+      await this.closeUnsentAttempt(attempt, 'Checkout closed before this payment request was sent.');
+    }
+  }
+
+  private async closeUnsentAttempt(attempt: { _id: Types.ObjectId; terminal_lock?: string }, reason: string) {
+    const closed = await this.model('PosPaymentAttempt').updateOne({ _id: attempt._id, status: 'queued' }, {
+      $set: { status: 'failed', review_reason: reason },
+    });
+    if (closed.matchedCount && attempt.terminal_lock) await this.model('PosTerminalLock').deleteOne({ _id: attempt.terminal_lock, attempt: attempt._id });
   }
 
   async credits(user: PosJwtPayload, customerId: string) {

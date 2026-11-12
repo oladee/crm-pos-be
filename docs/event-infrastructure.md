@@ -83,6 +83,36 @@ The API defaults to `POS_PAYMENT_RECONCILIATION_MODE=legacy`. To cut over:
 Existing checkout settlement, provider credentials, legacy Squad transfers,
 and explicit manual payment confirmation continue through their existing handlers.
 
+## Outbound provider requests
+
+Deploy the Phase 6 API and PWA with `POS_PAYMENT_DISPATCH_MODE=inline`.
+Once the BullMQ payment relay and worker are running, set
+`POS_PAYMENT_DISPATCH_MODE=bullmq` on all POS API replicas while retaining
+`POS_PAYMENT_RECONCILIATION_MODE=bullmq`. The dispatch flag only takes effect
+in BullMQ reconciliation mode. The API returns the persisted attempt and
+reference immediately. The PWA shows that the request is queued until the
+payment worker claims it.
+
+The Mongo attempt and terminal lock are committed before any outbound request.
+The relay reconstructs dispatch jobs after Redis downtime. Claiming changes
+the attempt to pending before calling the provider. After an ambiguous response
+or worker crash, reconciliation checks the original reference and never repeats
+the provider initiation automatically. A Squad result without independently
+verified payable amount or fees remains held for review if money arrives.
+At claim time the worker rechecks the staff assignment, active location, till
+enrollment, provider flags and Moniepoint account and terminal mapping.
+An ineligible or already closed checkout cannot send a queued request. Staff
+can cancel a checkout with only unsent queued attempts and release its stock
+and terminal locks. Once an attempt is claimed, cancellation remains blocked
+until the payment outcome is known. Claimed attempts reconcile by the original
+reference even after a provider is disabled or a terminal mapping changes.
+
+To roll back dispatch only, restore `POS_PAYMENT_DISPATCH_MODE=inline` and keep
+the BullMQ reconciliation relay and worker running. Existing queued attempts
+still dispatch from Mongo and pending attempts still reconcile by reference.
+Use the separate reconciliation rollback procedure above only if changing
+`POS_PAYMENT_RECONCILIATION_MODE` too.
+
 ## Live tills and notifications
 
 After deploying the CRM ticket route and the POS gateway, enable
