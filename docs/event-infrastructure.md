@@ -52,3 +52,33 @@ Set `EVENT_TEST_REDIS_BINARY` to a local `redis-server` executable and optionall
 set `MONGOMS_SYSTEM_BINARY` to a compatible `mongod` executable. After the build,
 run `node --test test/event-infrastructure.cjs`. The test starts a disposable
 MongoDB replica set and a Redis server bound to a random localhost port.
+
+## Payment reconciliation
+
+The standard checkout keeps verified webhooks in `pos_webhook_inbox` and
+payment check schedules in `pos_payment_attempts`. The payment relay rebuilds
+BullMQ jobs from these collections and schedules status checks up to 15 seconds
+ahead. Redis jobs contain only the Mongo record ID. The worker rechecks the
+stored schedule and claims the Mongo lease before processing. A leased record
+becomes eligible again after its lease expires, including after a worker crash.
+The provider transaction and checkout guards still govern financial changes.
+
+The API defaults to `POS_PAYMENT_RECONCILIATION_MODE=legacy`. To cut over:
+
+1. Deploy the new code to every API replica with the default mode. Prepare
+   separate `pnpm payments:relay` and `pnpm payments:worker` services with the
+   same MongoDB and provider configuration as the API, plus `EVENT_REDIS_URL`.
+2. Move every API replica to `POS_PAYMENT_RECONCILIATION_MODE=bullmq` and confirm
+   old replicas have drained before starting the relay and worker in BullMQ mode.
+   Webhooks remain durable during the gap. In BullMQ mode, the checkout refresh
+   endpoint reads current state while the worker owns provider status checks.
+3. Check an accepted webhook audit record's exchange ID against the worker
+   correlation ID. Check due work and provider audit rows before scaling workers.
+   The same status reconciliation also recovers queued attempts abandoned before
+   their synchronous initial dispatch began.
+4. To roll back, stop the payment worker and relay before restoring API replicas
+   to `legacy`. Existing Mongo leases expire naturally. Keep
+   `POS_PAYMENT_WORKER_ENABLED=true` on whichever reconciliation path is active.
+
+Existing checkout settlement, provider credentials, legacy Squad transfers,
+and explicit manual payment confirmation continue through their existing handlers.

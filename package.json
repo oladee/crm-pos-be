@@ -16,6 +16,8 @@
     "events:worker": "node --env-file-if-exists=.env dist/events/main.js worker",
     "events:smoke": "node --env-file-if-exists=.env dist/events/main.js smoke",
     "events:replay": "node --env-file-if-exists=.env dist/events/main.js replay",
+    "payments:relay": "node --env-file-if-exists=.env dist/events/payment-main.js relay",
+    "payments:worker": "node --env-file-if-exists=.env dist/events/payment-main.js worker",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
     "test": "jest",
     "test:watch": "jest --watch",

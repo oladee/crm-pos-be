@@ -35,7 +35,7 @@ export const PosTerminalLockSchema = new Schema({
 }, { collection: 'pos_terminal_locks', timestamps: true });
 
 export const PosWebhookInboxSchema = new Schema({
-  provider: String, account_key: String, event_id: String, evidence: Schema.Types.Mixed,
+  provider: String, account_key: String, event_id: String, evidence: Schema.Types.Mixed, correlation_id: String,
   state: { type: String, enum: ['pending', 'done', 'review'], default: 'pending' },
   hub: { type: Schema.Types.ObjectId, ref: 'Hub' }, review_reason: String,
   lease_owner: String, lease_until: Date, received_at: { type: Date, default: Date.now },

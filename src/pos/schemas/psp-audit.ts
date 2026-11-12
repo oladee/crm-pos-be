@@ -1,7 +1,7 @@
 import { Schema } from 'mongoose';
 
 export const PspAuditSchema = new Schema({
-  event_id: { type: String, required: true, unique: true }, exchange_id: { type: String, required: true },
+  event_id: { type: String, required: true, unique: true }, exchange_id: { type: String, required: true }, correlation_id: String,
   schema_version: { type: Number, required: true }, recorded_at: { type: Date, required: true },
   provider_id: { type: String, enum: ['moniepoint', 'squad', 'bachs'], required: true }, account_key: String,
   location_id: String, device_id: String, cashier_id: String, checkout_id: String, attempt_id: String,

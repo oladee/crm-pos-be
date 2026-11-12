@@ -11,7 +11,7 @@ export class PspAuditService {
 
   async append(input: Record<string, unknown>) {
     // Explicit metadata schema; no caller-supplied headers, errors or arbitrary objects.
-    const fields = ['exchange_id', 'provider_id', 'account_key', 'location_id', 'device_id', 'cashier_id', 'checkout_id', 'attempt_id',
+    const fields = ['exchange_id', 'correlation_id', 'provider_id', 'account_key', 'location_id', 'device_id', 'cashier_id', 'checkout_id', 'attempt_id',
       'merchant_reference', 'provider_transaction_id', 'provider_request_id', 'terminal_serial', 'business_id', 'business_owner_id',
       'amount_kobo', 'direction', 'operation', 'stage', 'method', 'endpoint', 'event_type', 'delivery_id', 'verification_result',
       'outcome', 'http_status', 'elapsed_ms', 'error_code', 'body_sha256', 'body_bytes', 'payload_format'];
@@ -56,7 +56,7 @@ export class PspAuditService {
     try { await this.append({ ...common, stage: 'webhook_received' }); }
     catch { throw new ServiceUnavailableException('Payment audit storage unavailable; webhook not acknowledged'); }
     let verification_result = 'unverified', evidence: any;
-    const trace: WebhookTrace = { verified: next => { verification_result = 'valid'; evidence = next; }, rejected: reason => { verification_result = reason; } };
+    const trace: WebhookTrace = { correlationId: exchange_id, verified: next => { verification_result = 'valid'; evidence = next; }, rejected: reason => { verification_result = reason; } };
     let result: T;
     try { result = await work(trace); }
     catch (error) {
@@ -78,7 +78,7 @@ export class PspAuditService {
     if (query.provider) { if (!['moniepoint', 'squad', 'bachs'].includes(query.provider)) throw new BadRequestException('Invalid provider'); filter.provider_id = query.provider; }
     if (query.reference) {
       if (typeof query.reference !== 'string' || query.reference.length > 160) throw new BadRequestException('Invalid reference');
-      filter.$or = [{ merchant_reference: query.reference }, { provider_transaction_id: query.reference }, { exchange_id: query.reference }];
+      filter.$or = [{ merchant_reference: query.reference }, { provider_transaction_id: query.reference }, { exchange_id: query.reference }, { correlation_id: query.reference }];
     }
     if (query.before) { if (typeof query.before !== 'string' || !Types.ObjectId.isValid(query.before)) throw new BadRequestException('Invalid cursor'); filter._id = { $lt: new Types.ObjectId(query.before) }; }
     const rows = await this.db.db!.collection('pos_psp_audit').find(filter).sort({ _id: -1 }).limit(51).toArray();

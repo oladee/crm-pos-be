@@ -45,9 +45,18 @@ describe('customer checkout and payment recovery', () => {
         'moniepoint-webhook-signature': signatureValid ? signature : 'bad' } });
     return response;
   }
+  async function squadWebhook(payment) {
+    requests.get(payment.reference).paid = true;
+    const body = { merchant_reference: payment.reference, transaction_reference: `squad-txn-${payment.reference}`,
+      amount_received: payment.payableKobo / 100, transaction_status: 'SUCCESS', currency: 'NGN' };
+    const signed = JSON.stringify({ transaction_reference: body.transaction_reference, amount_received: body.amount_received, merchant_reference: body.merchant_reference });
+    return fetch(base + '/pos/webhooks/squad', { method: 'POST', body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json', 'x-squad-encrypted-body': crypto.createHmac('sha512', 'sandbox_test').update(signed).digest('hex') } });
+  }
 
   before(async () => {
     process.env.POS_PAYMENT_WORKER_ENABLED = 'false'; process.env.POS_PAYMENT_RESERVATIONS_ENABLED = 'true';
+    process.env.POS_PAYMENT_RECONCILIATION_MODE = 'legacy';
     process.env.MONIEPOINT_ENABLED = 'true'; process.env.MONIEPOINT_TEST_API_KEY = 'test-key'; process.env.MONIEPOINT_TEST_SECRET = 'test-webhook-secret';
     process.env.SQUAD_ENABLED = 'true'; process.env.SQUAD_DVA_APPROVED = 'true'; process.env.SQUAD_CONTRACT_VERIFIED = 'true'; process.env.SQUAD_SECRET_KEY = 'sandbox_test';
     process.env.MONIEPOINT_ACCOUNTS_JSON = JSON.stringify({ lagos: { businessId: '100', businessOwnerId: '101', apiKeyEnv: 'MONIEPOINT_TEST_API_KEY', webhookSecretEnv: 'MONIEPOINT_TEST_SECRET' } });
@@ -338,10 +347,8 @@ describe('customer checkout and payment recovery', () => {
   });
   it('uses Squad as an alternate PSP with separate customer charges and a signed webhook', async () => {
     const row = await attempt(await create('squad'), 'squad-attempt', 'squad'); const payment = row.attempts[0];
-    assert.equal(payment.payableKobo, 20100); requests.get(payment.reference).paid = true;
-    const body = { merchant_reference: payment.reference, transaction_reference: `squad-txn-${payment.reference}`, amount_received: 201, transaction_status: 'SUCCESS', currency: 'NGN' };
-    const signed = JSON.stringify({ transaction_reference: body.transaction_reference, amount_received: body.amount_received, merchant_reference: body.merchant_reference });
-    const response = await fetch(base + '/pos/webhooks/squad', { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json', 'x-squad-encrypted-body': crypto.createHmac('sha512', 'sandbox_test').update(signed).digest('hex') } });
+    assert.equal(payment.payableKobo, 20100);
+    const response = await squadWebhook(payment);
     assert.equal(response.status, 201); await service.tick();
     const completed = (await api(`/checkouts/${row.id}`)).data;
     assert.equal(completed.status, 'completed'); assert.equal(completed.receipt.receiptPayment.feeKobo, 100);
@@ -350,6 +357,265 @@ describe('customer checkout and payment recovery', () => {
     assert.ok(audit.some(row => row.stage === 'request_intent' && row.location_id === String(hub)));
     assert.ok(audit.some(row => row.stage === 'webhook_result' && row.verification_result === 'valid'));
     assert.ok(!JSON.stringify(audit).includes('sandbox_test'));
+  });
+
+  it('recovers verified webhooks and scheduled checks through BullMQ', {
+    skip: !process.env.EVENT_TEST_REDIS_BINARY && 'set EVENT_TEST_REDIS_BINARY for real BullMQ coverage',
+    timeout: 60_000,
+  }, async () => {
+    const { spawn } = require('node:child_process');
+    const { once } = require('node:events');
+    const { createServer } = require('node:net');
+    const { setTimeout: delay } = require('node:timers/promises');
+    const { Queue, Worker } = require('bullmq');
+    const Redis = require('ioredis');
+    const { PaymentReconciliationRelay, paymentReconciliationQueue, reconcilePaymentJob } = require('../dist/events/payment-reconciliation');
+    const portProbe = createServer();
+    await new Promise(resolve => portProbe.listen(0, '127.0.0.1', resolve));
+    const address = { host: '127.0.0.1', port: portProbe.address().port };
+    await new Promise(resolve => portProbe.close(resolve));
+    const redis = new Redis({ ...address, lazyConnect: true, enableOfflineQueue: false, maxRetriesPerRequest: 1 });
+    redis.on('error', () => {});
+    const inbox = db.model('PosWebhookInbox');
+    const attempts = db.model('PosPaymentAttempt');
+    const originalUpdate = inbox.updateOne;
+    const logs = [], originalLog = console.log, originalError = console.error;
+    const secret = 'sensitive-error-text-must-not-leave-the-worker';
+    console.log = value => logs.push(String(value)); console.error = value => logs.push(String(value));
+    let redisServer, jobs, worker;
+    const waitFor = async predicate => {
+      for (let count = 0; count < 120; count++) {
+        if (await predicate()) return;
+        await delay(100);
+      }
+      assert.fail('Payment reconciliation did not reach the expected state');
+    };
+    const startWorker = async () => {
+      worker = new Worker(paymentReconciliationQueue, job => reconcilePaymentJob(db, service, job), { connection: address, concurrency: 4 });
+      worker.on('error', () => {});
+      await worker.waitUntilReady();
+    };
+    process.env.POS_PAYMENT_RECONCILIATION_MODE = 'bullmq';
+    try {
+      const checkout = await attempt(await create('queued-webhook'));
+      const payment = checkout.attempts[0];
+      assert.equal((await webhook(payment, {}, false)).status, 400);
+      assert.equal(await inbox.countDocuments(), 0);
+      assert.equal((await webhook(payment)).status, 201);
+      assert.equal((await webhook(payment)).status, 201);
+      assert.equal(await inbox.countDocuments(), 1);
+      const event = await inbox.findOne();
+      assert.ok(await db.collection('pos_psp_audit').findOne({ exchange_id: event.correlation_id, stage: 'webhook_received' }));
+      await service.tick();
+      assert.equal((await api(`/checkouts/${checkout.id}?refresh=1`)).data.status, 'awaiting');
+      assert.equal(await db.model('Sale').countDocuments(), 0);
+      assert.equal(await db.collection('pos_psp_audit').countDocuments({ operation: 'status_lookup' }), 0);
+
+      redisServer = spawn(process.env.EVENT_TEST_REDIS_BINARY,
+        ['--bind', address.host, '--port', String(address.port), '--save', '', '--appendonly', 'no'],
+        { stdio: 'ignore', windowsHide: true });
+      await redis.connect().catch(() => undefined);
+      await waitFor(() => redis.status === 'ready');
+      jobs = new Queue(paymentReconciliationQueue, { connection: redis });
+      jobs.on('error', () => {});
+      let relay = new PaymentReconciliationRelay(db, jobs);
+      const jobId = `payment.webhook.received.v1-${event._id}-0`;
+      await relay.dispatch();
+      assert.deepEqual((await jobs.getJob(jobId)).data, { recordId: String(event._id) });
+      await jobs.obliterate({ force: true }); // Redis lost jobs before any worker could consume them.
+      assert.equal(await jobs.getJob(jobId), undefined);
+      relay = new PaymentReconciliationRelay(db, jobs);
+      await relay.dispatch();
+      assert.ok(await jobs.getJob(jobId));
+
+      // The financial commit succeeds, but the inbox acknowledgement and retry update both fail.
+      inbox.updateOne = function (filter, ...args) {
+        if (String(filter._id) === String(event._id) && filter.lease_owner) throw new Error(secret);
+        return originalUpdate.call(this, filter, ...args);
+      };
+      await startWorker();
+      await waitFor(async () => (await jobs.getJob(jobId))?.failedReason === 'reconciliation_error');
+      assert.equal(await db.model('Sale').countDocuments(), 1);
+      assert.equal((await inbox.findById(event._id)).state, 'pending');
+      assert.ok(!JSON.stringify((await jobs.getJob(jobId)).stacktrace).includes(secret));
+      await worker.close(); worker = undefined;
+      inbox.updateOne = originalUpdate;
+      await inbox.updateOne({ _id: event._id }, { $set: { lease_until: new Date(Date.now() - 1) } });
+      await startWorker();
+      await relay.dispatch();
+      await waitFor(async () => (await inbox.findById(event._id)).state === 'done');
+      assert.equal(await db.model('Sale').countDocuments(), 1);
+      assert.equal(await db.model('PosProviderTransaction').countDocuments(), 1);
+      assert.equal((await db.model('Product').findById(product)).current_stock, 8);
+
+      const squad = await attempt(await create('queued-squad-race'), 'squad', 'squad');
+      const squadPayment = squad.attempts[0];
+      assert.equal((await squadWebhook(squadPayment)).status, 201);
+      const manualResult = manual(squad, { attemptId: squadPayment.id, amountKobo: squadPayment.payableKobo });
+      await relay.dispatch();
+      assert.equal((await manualResult).status, 201);
+      await waitFor(async () => (await inbox.findOne({ provider: 'squad' }))?.state === 'done');
+      assert.equal(await db.model('Sale').countDocuments(), 2);
+      assert.equal(await db.model('PosProviderTransaction').countDocuments(), 2);
+      assert.equal((await db.model('Product').findById(product)).current_stock, 6);
+
+      const byStatus = await attempt(await create('queued-status-only'));
+      const statusPayment = byStatus.attempts[0];
+      requests.get(statusPayment.reference).paid = true;
+      const due = new Date(Date.now() + 1000);
+      await attempts.updateOne({ _id: statusPayment.id }, { $set: { next_check: due } });
+      await relay.dispatch();
+      const statusJobId = `payment.status.check.v1-${statusPayment.id}-${due.getTime()}`;
+      const statusJob = await jobs.getJob(statusJobId);
+      assert.equal(await statusJob.getState(), 'delayed');
+      assert.deepEqual(statusJob.data, { recordId: statusPayment.id });
+      await waitFor(async () => (await db.model('PosCheckout').findById(byStatus.id)).status === 'completed');
+      assert.ok(await db.collection('pos_psp_audit').findOne({ correlation_id: statusPayment.id, operation: 'status_lookup', stage: 'http_response' }));
+      assert.equal(await db.model('Sale').countDocuments(), 3);
+      const trace = logs.map(line => JSON.parse(line)).filter(line => line.correlationId === event.correlation_id);
+      assert.ok(trace.some(line => line.action === 'payment_webhook_persisted'));
+      assert.ok(trace.some(line => line.action === 'payment_reconciliation_failed'));
+      assert.ok(trace.some(line => line.action === 'payment_reconciliation_done'));
+      assert.ok(!logs.join('\n').includes(secret));
+    } finally {
+      inbox.updateOne = originalUpdate;
+      if (worker) await worker.close();
+      redis.disconnect();
+      if (jobs) await jobs.close();
+      if (redisServer && redisServer.exitCode === null) {
+        const exited = once(redisServer, 'exit'); redisServer.kill(); await exited;
+      }
+      process.env.POS_PAYMENT_RECONCILIATION_MODE = 'legacy';
+      console.log = originalLog; console.error = originalError;
+    }
+  });
+
+  it('fences stale poll writes after a replacement poll takes ownership', async () => {
+    const { MoniepointClient } = require('../dist/pos/moniepoint.client');
+    const originalCheck = MoniepointClient.prototype.check;
+    const row = await attempt(await create('stale-poll'));
+    const payment = row.attempts[0];
+    const model = db.model('PosPaymentAttempt');
+    const evidence = { reference: payment.reference, terminalSerial: 'SERIAL-1', businessOwnerId: '101', currency: 'NGN', method: 'Transfer' };
+    try {
+      for (const lateResult of [
+        () => ({ ...evidence, status: 'failed' }),
+        () => { throw new Error('The original poll transport failed'); },
+        () => ({ ...evidence, status: 'review', amountKobo: 1 }),
+      ]) {
+        let started, resume;
+        const began = new Promise(resolve => { started = resolve; });
+        const stalled = new Promise(resolve => { resume = resolve; });
+        let calls = 0;
+        MoniepointClient.prototype.check = async () => {
+          if (++calls === 1) { started(); await stalled; return lateResult(); }
+          return { ...evidence, status: 'pending' };
+        };
+        const oldPoll = service.poll(await model.findById(payment.id), payment.id);
+        await began;
+        try {
+          await model.updateOne({ _id: payment.id }, { $set: { lease_until: new Date(Date.now() - 1) } });
+          assert.equal(await service.poll(await model.findById(payment.id), payment.id), 'checked');
+          const replacement = await model.findById(payment.id);
+          resume();
+          assert.equal(await oldPoll, 'stale');
+          const actual = await model.findById(payment.id);
+          assert.equal(actual.next_check.getTime(), replacement.next_check.getTime());
+          assert.equal(actual.status, 'pending');
+          assert.equal(actual.failures, 0);
+          assert.equal(await db.model('PosTerminalLock').countDocuments(), 1);
+          assert.equal(await db.model('PosWebhookInbox').countDocuments(), 0);
+          assert.equal(await db.model('Sale').countDocuments(), 0);
+        } finally {
+          resume();
+          await oldPoll;
+        }
+      }
+      MoniepointClient.prototype.check = async () => {
+        await model.updateOne({ _id: payment.id }, { $set: { lease_until: new Date(Date.now() - 1) } });
+        return { ...evidence, status: 'paid', amountKobo: payment.payableKobo, transactionReference: 'valid-late-payment' };
+      };
+      await service.poll(await model.findById(payment.id), payment.id);
+      assert.equal((await model.findById(payment.id)).status, 'paid');
+      assert.equal(await db.model('PosTerminalLock').countDocuments(), 0);
+      assert.equal(await db.model('Sale').countDocuments(), 1);
+    } finally {
+      MoniepointClient.prototype.check = originalCheck;
+    }
+  });
+
+  it('does not release a terminal when a stale provider dispatch returns a definite error', async () => {
+    const { MoniepointClient } = require('../dist/pos/moniepoint.client');
+    const { ProviderFailure } = require('../dist/pos/payment-provider');
+    const originalOpen = MoniepointClient.prototype.open, originalCheck = MoniepointClient.prototype.check;
+    let started, resume;
+    const began = new Promise(resolve => { started = resolve; });
+    const stalled = new Promise(resolve => { resume = resolve; });
+    const model = db.model('PosPaymentAttempt');
+    let opening;
+    try {
+      const row = await create('stale-dispatch');
+      MoniepointClient.prototype.open = async () => {
+        started(); await stalled; throw new ProviderFailure('Old request returned a definite error', true);
+      };
+      MoniepointClient.prototype.check = async reference => ({
+        reference, terminalSerial: 'SERIAL-1', businessOwnerId: '101', status: 'pending',
+      });
+      opening = attempt(row);
+      await began;
+      const pending = await model.findOne({ checkout: row.id });
+      await model.updateOne({ _id: pending._id }, { $set: { lease_until: new Date(Date.now() - 1) } });
+      assert.equal(await service.poll(await model.findById(pending._id), String(pending._id)), 'checked');
+      const scheduled = (await model.findById(pending._id)).next_check;
+      resume();
+      const result = await opening;
+      assert.equal(result.attempts[0].status, 'pending');
+      assert.equal((await model.findById(pending._id)).next_check.getTime(), scheduled.getTime());
+      assert.equal(await db.model('PosTerminalLock').countDocuments(), 1);
+      assert.equal(await db.model('Sale').countDocuments(), 0);
+    } finally {
+      resume();
+      await opening;
+      MoniepointClient.prototype.open = originalOpen;
+      MoniepointClient.prototype.check = originalCheck;
+    }
+  });
+
+  it('keeps verified Squad instructions from the original request after its lease expires', async () => {
+    const { SquadClient } = require('../dist/pos/squad.client');
+    const originalOpen = SquadClient.prototype.open;
+    let started, resume;
+    const began = new Promise(resolve => { started = resolve; });
+    const stalled = new Promise(resolve => { resume = resolve; });
+    const model = db.model('PosPaymentAttempt');
+    let opening;
+    try {
+      const row = await create('late-squad-instructions');
+      SquadClient.prototype.open = async function (...args) {
+        const instructions = await originalOpen.apply(this, args);
+        started(); await stalled;
+        return instructions;
+      };
+      opening = attempt(row, 'late-squad', 'squad');
+      await began;
+      const pending = await model.findOne({ checkout: row.id });
+      await model.updateOne({ _id: pending._id }, { $set: { lease_until: new Date(Date.now() - 1) } });
+      assert.equal(await service.poll(await model.findById(pending._id), String(pending._id)), 'checked');
+      const scheduled = (await model.findById(pending._id)).next_check;
+      resume();
+      const result = await opening;
+      assert.equal(result.attempts[0].status, 'pending');
+      assert.equal(result.attempts[0].payableKobo, 20100);
+      assert.equal(result.attempts[0].feeKobo, 100);
+      assert.equal((await model.findById(pending._id)).next_check.getTime(), scheduled.getTime());
+      assert.equal((await squadWebhook(result.attempts[0])).status, 201);
+      await service.tick();
+      assert.equal(await db.model('Sale').countDocuments(), 1);
+    } finally {
+      resume();
+      await opening;
+      SquadClient.prototype.open = originalOpen;
+    }
   });
 
   it('audits requests, each webhook retry and rejection without duplicate sales; restricts reads to managers', async () => {

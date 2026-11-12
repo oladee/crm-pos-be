@@ -8,6 +8,7 @@ import {
 
 export type EventJob = { eventId: string; generation: number };
 type Trace = {
+  queue?: string;
   eventId?: string;
   hubId?: string;
   correlationId?: string;
@@ -15,6 +16,11 @@ type Trace = {
   attempt?: number;
   generation?: number;
   type?: string;
+  provider?: string;
+  checkoutId?: string;
+  inboxId?: string;
+  attemptId?: string;
+  count?: number;
   code?: string;
 };
 

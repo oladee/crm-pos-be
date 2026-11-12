@@ -40,3 +40,7 @@ export function settingMilliseconds(name: string, fallback: number) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value >= 100 && value <= 300_000 ? value : fallback;
 }
+
+export function bullmqReconciliationEnabled() {
+  return process.env.POS_PAYMENT_RECONCILIATION_MODE === 'bullmq';
+}

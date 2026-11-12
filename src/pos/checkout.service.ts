@@ -4,14 +4,19 @@ import { Connection, Model, Types } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { PosService } from './pos.service';
 import { PosJwtPayload } from './pos-auth';
-import { checkoutConfiguration, settingMilliseconds } from './checkout-config';
+import { bullmqReconciliationEnabled, checkoutConfiguration, settingMilliseconds } from './checkout-config';
 import { MoniepointClient, TerminalEvidence } from './moniepoint.client';
 import { SquadClient } from './squad.client';
 import { ProviderFailure } from './payment-provider';
 import type { PspAuditService } from './psp-audit.service';
 import type { WebhookTrace } from './psp-audit';
+import { eventLog } from '../events/event-jobs';
+import { isEventId } from '../events/event-outbox';
+import { paymentReconciliationQueue } from '../events/payment-reconciliation';
 
 const ACTIVE = ['queued', 'pending', 'unknown', 'review'];
+const paymentLease = () => new Date(Date.now() + Math.max(90_000, settingMilliseconds('MONIEPOINT_HTTP_TIMEOUT_MS', 10_000) + 30_000));
+const activeLease = (owner: string) => ({ lease_owner: owner, lease_until: { $gt: new Date() } });
 const money = (value: unknown) => {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new BadRequestException('Amount must be a non-negative integer in kobo');
   return value;
@@ -23,24 +28,24 @@ const creditStatus = (balance: number, due: Date) => balance === 0 ? 'Clear' : n
 export class CheckoutService implements OnModuleInit, OnModuleDestroy {
   private timer?: ReturnType<typeof setInterval>;
   private working = false;
-  private readonly worker = randomUUID();
   constructor(@InjectConnection() private readonly db: Connection, private readonly pos: PosService, @Inject('PSP_AUDIT') private readonly audit: PspAuditService) {}
   private auditHttp(attempt: any) {
     return this.audit.http({ provider_id: attempt.provider, account_key: attempt.account_key, attempt_id: String(attempt._id),
       checkout_id: String(attempt.checkout), merchant_reference: attempt.merchant_reference, terminal_serial: attempt.terminal_serial,
       location_id: String(attempt.audit_location || ''), device_id: attempt.audit_device, cashier_id: attempt.audit_cashier,
-      business_id: attempt.account_snapshot?.businessId, business_owner_id: attempt.account_snapshot?.businessOwnerId, amount_kobo: attempt.amount_kobo });
+      business_id: attempt.account_snapshot?.businessId, business_owner_id: attempt.account_snapshot?.businessOwnerId, amount_kobo: attempt.amount_kobo,
+      correlation_id: attempt.audit_correlation_id });
   }
-  private async auditedAttempt(attempt: any) {
+  private async auditedAttempt(attempt: any, correlationId?: string) {
     const checkout = await this.model('PosCheckout').findById(attempt.checkout).lean();
     return { ...(attempt.toObject ? attempt.toObject() : attempt), audit_location: checkout?.hub,
-      audit_device: checkout?.device_id, audit_cashier: checkout?.cashier ? String(checkout.cashier) : undefined };
+      audit_device: checkout?.device_id, audit_cashier: checkout?.cashier ? String(checkout.cashier) : undefined, audit_correlation_id: correlationId };
   }
   private model(name: string): Model<any> { return this.db.model(name) as unknown as Model<any>; }
   private atomic<T>(work: () => Promise<T>): Promise<T> { return this.pos.inventoryTransaction(work); }
 
   onModuleInit() {
-    if (process.env.POS_PAYMENT_WORKER_ENABLED === 'false') return;
+    if (process.env.POS_PAYMENT_WORKER_ENABLED === 'false' || bullmqReconciliationEnabled()) return;
     this.timer = setInterval(() => { void this.tick().catch(() => undefined); }, 1000);
     this.timer.unref();
   }
@@ -158,7 +163,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
 
   async get(user: PosJwtPayload, id: string, refresh = false) {
     const row = await this.row(user, id);
-    if (refresh) {
+    if (refresh && !bullmqReconciliationEnabled()) {
       const attempts = await this.model('PosPaymentAttempt').find({ checkout: row._id, status: { $in: ACTIVE } });
       for (const attempt of attempts) await this.poll(attempt);
     }
@@ -205,7 +210,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
         account_snapshot: provider === 'moniepoint' ? config.accounts[mapping.accountKey] : undefined,
         terminal_serial: terminalLock ? mapping.terminalSerial : undefined, terminal_lock: terminalLock,
         amount_kobo: row.due_kobo, payable_kobo: provider === 'moniepoint' ? row.due_kobo : undefined,
-        fee_kobo: provider === 'moniepoint' ? 0 : undefined, status: 'queued', next_check: new Date(),
+        fee_kobo: provider === 'moniepoint' ? 0 : undefined, status: 'queued', next_check: new Date(Date.now() + (bullmqReconciliationEnabled() ? 15_000 : 0)),
       }]);
     }).catch(async error => {
       if (error?.code === 11000 && await this.model('PosPaymentAttempt').exists({ checkout: checkout._id, client_attempt_id: clientId })) return;
@@ -216,10 +221,12 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     return this.view(await this.model('PosCheckout').findById(id));
   }
 
-  private async dispatch(attempt: any) {
-    const claimed = await this.model('PosPaymentAttempt').findOneAndUpdate({ _id: attempt._id, status: 'queued' },
-      { $set: { status: 'pending', lease_owner: this.worker, lease_until: new Date(Date.now() + 90_000), next_check: new Date(Date.now() + 15_000) } }, { returnDocument: 'after' });
-    if (!claimed) return;
+  private async dispatch(attempt: any, scheduled = false) {
+    const owner = randomUUID();
+    const claimed = await this.model('PosPaymentAttempt').findOneAndUpdate({ _id: attempt._id, status: 'queued',
+      ...(scheduled ? { next_check: attempt.next_check ?? null, lease_until: attempt.lease_until ?? null } : {}) },
+      { $set: { status: 'pending', lease_owner: owner, lease_until: paymentLease(), next_check: new Date(Date.now() + 15_000) } }, { returnDocument: 'after' });
+    if (!claimed) return 'stale';
     try {
       if (claimed.provider === 'moniepoint') {
         await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl, this.auditHttp(await this.auditedAttempt(claimed))).open(claimed.merchant_reference, claimed.terminal_serial, claimed.amount_kobo, claimed.method);
@@ -229,21 +236,30 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
         const customer = await this.model('Customer').findById(row.customer).lean();
         const email = customer?.customer_email || customer?.email || staff?.email;
         const opened = await this.squad(await this.auditedAttempt(claimed)).open({ clientSaleId: claimed.merchant_reference, amountKobo: claimed.amount_kobo, email });
-        await this.model('PosPaymentAttempt').updateOne({ _id: claimed._id }, { $set: { instructions: opened, payable_kobo: opened.payableKobo, fee_kobo: opened.payableKobo - claimed.amount_kobo } });
+        const instructions = { instructions: opened, payable_kobo: opened.payableKobo, fee_kobo: opened.payableKobo - claimed.amount_kobo };
+        // This is verified evidence from the original request. It can fill missing
+        // fees after a lease expires without changing reconciliation state.
+        await this.model('PosPaymentAttempt').updateOne({
+          _id: claimed._id, status: { $in: ['pending', 'unknown', 'review'] }, payable_kobo: null, instructions: null,
+        }, { $set: instructions });
       }
     } catch (error) {
       const definite = error instanceof ProviderFailure && error.definite;
       await this.atomic(async () => {
-        const current = await this.model('PosPaymentAttempt').findById(claimed._id);
-        if (!current || current.status === 'paid') return;
-        current.status = definite ? 'failed' : 'unknown';
-        current.review_reason = definite ? 'Provider declined this request. Use another method.' : 'Result unknown. Check the payment or confirm actual receipt before retrying.';
-        await current.save();
-        if (definite && current.terminal_lock) await this.model('PosTerminalLock').deleteOne({ _id: current.terminal_lock, attempt: current._id });
+        const result = await this.model('PosPaymentAttempt').updateOne({
+          _id: claimed._id, status: { $in: ACTIVE }, ...activeLease(owner),
+        }, { $set: {
+          status: definite ? 'failed' : 'unknown',
+          review_reason: definite ? 'Provider declined this request. Use another method.' : 'Result unknown. Check the payment or confirm actual receipt before retrying.',
+        } });
+        if (result.matchedCount && definite && claimed.terminal_lock) {
+          await this.model('PosTerminalLock').deleteOne({ _id: claimed.terminal_lock, attempt: claimed._id });
+        }
       });
     } finally {
-      await this.model('PosPaymentAttempt').updateOne({ _id: claimed._id, lease_owner: this.worker }, { $unset: { lease_owner: '', lease_until: '' } });
+      await this.model('PosPaymentAttempt').updateOne({ _id: claimed._id, ...activeLease(owner) }, { $unset: { lease_owner: '', lease_until: '' } });
     }
+    return 'dispatched';
   }
 
   private squad(attempt?: any) { return new SquadClient(process.env.SQUAD_SECRET_KEY || '', process.env.SQUAD_API_BASE_URL || undefined,
@@ -256,7 +272,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     try { evidence = new MoniepointClient(account, config.baseUrl).webhook(raw, headers); }
     catch { trace?.rejected('invalid_signature_or_business'); throw new BadRequestException('Invalid payment webhook'); }
     trace?.verified(evidence);
-    if (evidence) await this.enqueue('moniepoint', accountKey, evidence);
+    if (evidence) await this.enqueue('moniepoint', accountKey, evidence, trace?.correlationId);
     return { received: true };
   }
 
@@ -267,51 +283,76 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     if (!event) return true;
     if (!await this.model('PosPaymentAttempt').exists({ provider: 'squad', merchant_reference: event.reference }) &&
       await this.model('PosTransfer').exists({ provider: 'squad', $or: [{ client_sale_id: event.reference }, { checkout_id: event.reference }] })) return false;
-    await this.enqueue('squad', 'squad', { ...event, transactionReference: event.eventId, status: event.status === 'paid' ? 'paid' : 'review', method: 'Transfer' });
+    await this.enqueue('squad', 'squad', { ...event, transactionReference: event.eventId, status: event.status === 'paid' ? 'paid' : 'review', method: 'Transfer' }, trace?.correlationId);
     return true;
   }
 
-  private async enqueue(provider: string, account: string, evidence: any) {
+  private async enqueue(provider: string, account: string, evidence: any, correlationId?: string) {
     const attempt = evidence.reference ? await this.model('PosPaymentAttempt').findOne({ provider, account_key: account, merchant_reference: evidence.reference }) : null;
     const checkout = attempt ? await this.model('PosCheckout').findById(attempt.checkout) : null;
     // An unmatched Moniepoint event can still be scoped to its registered terminal.
     const mapping = Object.values(checkoutConfiguration().terminals).find(t => t.accountKey === account && t.terminalSerial === evidence.terminalSerial);
-    try { await this.model('PosWebhookInbox').create({ provider, account_key: account, event_id: evidence.eventId, evidence,
-      hub: checkout?.hub || mapping?.hubId, state: 'pending' }); }
+    try {
+      const [saved] = await this.model('PosWebhookInbox').create([{ provider, account_key: account, event_id: evidence.eventId,
+        evidence, correlation_id: isEventId(correlationId) ? correlationId : undefined,
+        hub: checkout?.hub || mapping?.hubId, state: 'pending' }], { w: 'majority' });
+      if (bullmqReconciliationEnabled()) eventLog('info', 'payment_webhook_persisted', {
+        queue: paymentReconciliationQueue, provider, inboxId: String(saved._id),
+        correlationId: saved.correlation_id || String(saved._id),
+        hubId: saved.hub ? String(saved.hub) : undefined,
+      });
+    }
     catch (error: any) { if (error?.code !== 11000) throw error; }
   }
 
-  async poll(attempt: any) {
-    if (attempt.status === 'queued') return this.dispatch(attempt);
+  async poll(attempt: any, correlationId?: string) {
+    const scheduled = correlationId != null;
+    if (attempt.status === 'queued') return this.dispatch(attempt, scheduled);
+    const owner = randomUUID();
     const claimed = await this.model('PosPaymentAttempt').findOneAndUpdate({ _id: attempt._id, status: { $in: ACTIVE },
-      $or: [{ lease_until: { $exists: false } }, { lease_until: { $lt: new Date() } }] },
-      { $set: { lease_owner: this.worker, lease_until: new Date(Date.now() + 90_000) } }, { returnDocument: 'after' });
-    if (!claimed) return;
+      ...(scheduled ? { next_check: attempt.next_check ?? null, lease_until: attempt.lease_until ?? null } : {}),
+      $or: [{ lease_until: null }, { lease_until: { $lte: new Date() } }] },
+      { $set: { lease_owner: owner, lease_until: paymentLease() } }, { returnDocument: 'after' });
+    if (!claimed) return 'stale';
     try {
       let event: any;
-      if (claimed.provider === 'moniepoint') event = await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl, this.auditHttp(await this.auditedAttempt(claimed))).check(claimed.merchant_reference);
+      if (claimed.provider === 'moniepoint') event = await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl, this.auditHttp(await this.auditedAttempt(claimed, correlationId))).check(claimed.merchant_reference);
       else {
-        const checked = await this.squad(await this.auditedAttempt(claimed)).check(claimed.merchant_reference);
+        const checked = await this.squad(await this.auditedAttempt(claimed, correlationId)).check(claimed.merchant_reference);
         event = { ...checked, status: checked.status === 'paid' ? 'paid' : checked.status === 'expired' ? 'review' : 'pending', method: 'Transfer' };
         // A query result without a stable transaction ID cannot consume a payment twice.
         if (event.status === 'paid' && !event.transactionReference) event.status = 'review';
       }
-      const reason = await this.apply(claimed, event);
+      const reason = await this.apply(claimed, event, owner);
+      const resetFailures = () => this.model('PosPaymentAttempt').updateOne(
+        { _id: claimed._id, ...activeLease(owner) }, { $set: { failures: 0 } });
       if (reason) {
-        const checkout = await this.model('PosCheckout').findById(claimed.checkout);
-        await this.model('PosWebhookInbox').updateOne({ provider: claimed.provider, account_key: claimed.account_key, event_id: `poll:${claimed.merchant_reference}:${event.transactionReference || 'review'}` },
-          { $setOnInsert: { evidence: event, hub: checkout?.hub, state: 'review', review_reason: reason } }, { upsert: true });
+        return await this.atomic(async () => {
+          if (!(await resetFailures()).matchedCount) return 'stale';
+          const checkout = await this.model('PosCheckout').findById(claimed.checkout);
+          await this.storePollReview(claimed, checkout?.hub, event, reason);
+          return 'review';
+        });
       }
-      await this.model('PosPaymentAttempt').updateOne({ _id: claimed._id }, { $set: { failures: 0 } });
+      return (await resetFailures()).matchedCount ? 'checked' : 'stale';
     } catch {
-      await this.model('PosPaymentAttempt').updateOne({ _id: claimed._id, status: { $in: ACTIVE } }, { $inc: { failures: 1 }, $set: { status: 'unknown', review_reason: 'Provider status is unavailable. The original request may still complete.' } });
+      const result = await this.model('PosPaymentAttempt').updateOne({ _id: claimed._id, status: { $in: ACTIVE }, ...activeLease(owner) },
+        { $inc: { failures: 1 }, $set: { status: 'unknown', review_reason: 'Provider status is unavailable. The original request may still complete.' } });
+      return result.matchedCount ? 'deferred' : 'stale';
     } finally {
       const backoff = Math.min(300_000, settingMilliseconds('MONIEPOINT_STATUS_POLL_INTERVAL_MS', 15_000) * 2 ** Math.min(claimed.failures || 0, 5));
-      await this.model('PosPaymentAttempt').updateOne({ _id: claimed._id, lease_owner: this.worker }, { $set: { next_check: new Date(Date.now() + backoff) }, $unset: { lease_owner: '', lease_until: '' } });
+      await this.model('PosPaymentAttempt').updateOne({ _id: claimed._id, ...activeLease(owner) }, { $set: { next_check: new Date(Date.now() + backoff) }, $unset: { lease_owner: '', lease_until: '' } });
     }
   }
 
-  private async apply(attempt: any, event: TerminalEvidence): Promise<string | null> {
+  private async storePollReview(attempt: any, hub: Types.ObjectId | undefined, event: TerminalEvidence, reason: string) {
+    await this.model('PosWebhookInbox').updateOne({
+      provider: attempt.provider, account_key: attempt.account_key,
+      event_id: `poll:${attempt.merchant_reference}:${event.transactionReference || 'review'}`,
+    }, { $setOnInsert: { evidence: event, hub, state: 'review', review_reason: reason } }, { upsert: true });
+  }
+
+  private async apply(attempt: any, event: TerminalEvidence, pollOwner?: string): Promise<string | null> {
     return this.atomic(async () => {
       const row = await this.lock(attempt.checkout);
       const current = await this.model('PosPaymentAttempt').findById(attempt._id);
@@ -320,32 +361,40 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
         (event.terminalSerial !== current.terminal_serial || event.businessOwnerId !== current.account_snapshot.businessOwnerId ||
         (event.businessId != null && event.businessId !== current.account_snapshot.businessId)))) return 'Payment reference, business or terminal does not match';
       if (event.status === 'pending') return null;
+      const updateNonSettlement = (changes: Record<string, unknown>) => this.model('PosPaymentAttempt').updateOne(
+        { _id: current._id, ...(pollOwner ? activeLease(pollOwner) : {}) }, { $set: changes });
       if (event.status === 'failed') {
-        if (current.status !== 'paid') { current.status = 'failed'; await current.save(); }
+        if (current.status === 'paid' || !(await updateNonSettlement({ status: 'failed' })).matchedCount) return null;
         if (current.terminal_lock) await this.model('PosTerminalLock').deleteOne({ _id: current.terminal_lock, attempt: current._id });
         return null;
       }
       if (event.status !== 'paid' || current.payable_kobo == null || event.currency !== 'NGN' || !Number.isSafeInteger(event.amountKobo) || event.amountKobo !== current.payable_kobo || !event.transactionReference || !event.method) {
-        current.status = current.status === 'paid' ? 'paid' : 'review'; current.review_reason = 'Payment needs amount, reference or status reconciliation'; await current.save();
-        return current.review_reason;
+        const reason = 'Payment needs amount, reference or status reconciliation';
+        const updated = await updateNonSettlement({ status: current.status === 'paid' ? 'paid' : 'review', review_reason: reason });
+        return updated.matchedCount ? reason : null;
       }
+      const paidReview = async (reason: string) => {
+        // Valid paid evidence remains durable even if the poll lease expired.
+        if (pollOwner) await this.storePollReview(current, row.hub, event, reason);
+        return reason;
+      };
       const unique = { provider: current.provider, account_key: current.account_key, transaction_reference: event.transactionReference };
       const previous = await this.model('PosProviderTransaction').findOne(unique);
-      if (previous && String(previous.checkout) !== String(row._id)) return 'Payment was already allocated to another checkout';
+      if (previous && String(previous.checkout) !== String(row._id)) return paidReview('Payment was already allocated to another checkout');
       const otherTransaction = await this.model('PosProviderTransaction').exists({ provider: current.provider, account_key: current.account_key,
         merchant_reference: current.merchant_reference, transaction_reference: { $ne: event.transactionReference } });
       if (!previous) await this.model('PosProviderTransaction').create([{ ...unique, checkout: row._id, merchant_reference: event.reference, amount_kobo: event.amountKobo }]);
       current.status = 'paid'; await current.save();
       if (current.terminal_lock) await this.model('PosTerminalLock').deleteOne({ _id: current.terminal_lock, attempt: current._id });
-      if (otherTransaction) return 'More than one provider transaction paid the same request';
+      if (otherTransaction) return paidReview('More than one provider transaction paid the same request');
       if (row.status === 'completed') {
         if (row.settled_attempt === String(current._id)) return null;
-        return 'Additional payment arrived after another collection completed this checkout';
+        return paidReview('Additional payment arrived after another collection completed this checkout');
       }
-      if (row.status === 'cancelled') return 'Payment arrived after cancellation';
+      if (row.status === 'cancelled') return paidReview('Payment arrived after cancellation');
       if (row.kind === 'repayment') {
         const credit = await this.model('CreditRecord').findById(row.credit);
-        if (!credit || ['Clear', 'Voided'].includes(credit.status) || kobo(credit.amount_owed) < row.due_kobo) return 'Outstanding credit changed before this payment arrived';
+        if (!credit || ['Clear', 'Voided'].includes(credit.status) || kobo(credit.amount_owed) < row.due_kobo) return paidReview('Outstanding credit changed before this payment arrived');
       }
       await this.complete(row, current, 'provider', event.method);
       return null;
@@ -457,27 +506,39 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     return { data: rows.map(r => ({ id: String(r._id), provider: r.provider, reference: r.evidence?.reference, amountKobo: r.evidence?.amountKobo, reason: r.review_reason, receivedAt: r.received_at })) };
   }
 
+  async processInbox(scheduled?: { _id: Types.ObjectId; lease_until?: Date }, correlationId?: string) {
+    const owner = randomUUID();
+    const event = await this.model('PosWebhookInbox').findOneAndUpdate({ state: 'pending',
+      ...(scheduled ? { _id: scheduled._id, lease_until: scheduled.lease_until ?? null } : {}),
+      $or: [{ lease_until: null }, { lease_until: { $lte: new Date() } }] },
+      { $set: { lease_owner: owner, lease_until: paymentLease() } }, { returnDocument: 'after' });
+    if (!event) return 'empty';
+    try {
+      const attempt = await this.model('PosPaymentAttempt').findOne({ provider: event.provider, account_key: event.account_key, merchant_reference: event.evidence.reference });
+      if (attempt?.provider === 'squad' && event.evidence.status === 'paid') {
+        const checked = await this.squad(await this.auditedAttempt(attempt, correlationId)).check(attempt.merchant_reference);
+        if (checked.status !== 'paid') throw new Error('Await provider query confirmation');
+      }
+      // Do not consume early Squad evidence until the account-creation response confirms fees.
+      if (attempt && attempt.payable_kobo == null && attempt.status === 'pending') throw new Error('Await provider instructions');
+      const reason = attempt ? await this.apply(attempt, event.evidence) : 'No matching payment reference';
+      const state = reason ? 'review' : 'done';
+      await this.model('PosWebhookInbox').updateOne({ _id: event._id, lease_owner: owner },
+        { $set: { state, review_reason: reason || undefined }, $unset: { lease_owner: '', lease_until: '' } });
+      return state;
+    } catch {
+      await this.model('PosWebhookInbox').updateOne({ _id: event._id, lease_owner: owner },
+        { $set: { lease_until: new Date(Date.now() + 15_000) }, $unset: { lease_owner: '' } });
+      return 'deferred';
+    }
+  }
+
   async tick() {
+    if (bullmqReconciliationEnabled()) return;
     if (this.working) return; this.working = true;
     try {
       for (let i = 0; i < 10; i++) {
-        const event = await this.model('PosWebhookInbox').findOneAndUpdate({ state: 'pending',
-          $or: [{ lease_until: { $exists: false } }, { lease_until: { $lt: new Date() } }] },
-          { $set: { lease_owner: this.worker, lease_until: new Date(Date.now() + 90_000) } }, { returnDocument: 'after' });
-        if (!event) break;
-        try {
-          const attempt = await this.model('PosPaymentAttempt').findOne({ provider: event.provider, account_key: event.account_key, merchant_reference: event.evidence.reference });
-          if (attempt?.provider === 'squad' && event.evidence.status === 'paid') {
-            const checked = await this.squad(await this.auditedAttempt(attempt)).check(attempt.merchant_reference);
-            if (checked.status !== 'paid') throw new Error('Await provider query confirmation');
-          }
-          // Do not consume early Squad evidence until the account-creation response confirms fees.
-          if (attempt && attempt.payable_kobo == null && attempt.status === 'pending') throw new Error('Await provider instructions');
-          const reason = attempt ? await this.apply(attempt, event.evidence) : 'No matching payment reference';
-          await this.model('PosWebhookInbox').updateOne({ _id: event._id, lease_owner: this.worker }, { $set: { state: reason ? 'review' : 'done', review_reason: reason || undefined }, $unset: { lease_owner: '', lease_until: '' } });
-        } catch {
-          await this.model('PosWebhookInbox').updateOne({ _id: event._id, lease_owner: this.worker }, { $set: { lease_until: new Date(Date.now() + 15_000) }, $unset: { lease_owner: '' } });
-        }
+        if (await this.processInbox() === 'empty') break;
       }
       const attempts = await this.model('PosPaymentAttempt').find({ status: { $in: ACTIVE }, next_check: { $lte: new Date() } }).limit(10);
       for (const attempt of attempts) await this.poll(attempt);

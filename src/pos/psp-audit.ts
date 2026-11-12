@@ -4,12 +4,12 @@ import { ProviderFailure } from './payment-provider';
 export type AuditContext = {
   provider_id: 'moniepoint' | 'squad' | 'bachs'; account_key: string;
   location_id?: string; device_id?: string; cashier_id?: string; checkout_id?: string;
-  attempt_id?: string; merchant_reference?: string; provider_transaction_id?: string;
+  attempt_id?: string; merchant_reference?: string; provider_transaction_id?: string; correlation_id?: string;
   terminal_serial?: string; business_id?: string; business_owner_id?: string; amount_kobo?: number;
 };
 export type AuditWriter = (record: Record<string, unknown>) => Promise<void>;
 export type AuditHttp = { context: AuditContext; write: AuditWriter };
-export type WebhookTrace = { verified: (evidence?: Record<string, any> | null) => void; rejected: (reason: string) => void };
+export type WebhookTrace = { correlationId?: string; verified: (evidence?: Record<string, any> | null) => void; rejected: (reason: string) => void };
 export const bodyHash = (body: string | Buffer) => createHash('sha256').update(body).digest('hex');
 const normalize = (key: string) => key.replace(/[^a-z0-9]/gi, '').toLowerCase();
 const sensitive = /authorization|cookie|signature|encryptedbody|secret|password|token|apikey|card|pan$|cvv|cvc|pin|track|cryptogram|email|phone|address|customer|payer|sender|beneficiary|accountname|fullname/i;
