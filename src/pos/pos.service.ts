@@ -53,6 +53,7 @@ type ProductDoc = {
   reserved_stock?: number;
   reserved_batches?: Record<string, number>;
   base_selling_price?: number;
+  image_url?: string;
   carton_price?: number;
   carton_weight?: number;
   avg_unit_cost?: number;
@@ -497,6 +498,7 @@ export class PosService {
         name: p.name,
         category: p.category || 'Other',
         price: nairaToKobo(p.base_selling_price || 0),
+        imageUrl: p.image_url,
         cartonPrice: nairaToKobo(p.carton_price || 0),
         cartonWeight: Number(p.carton_weight) || 0,
         cost: nairaToKobo(p.avg_unit_cost || 0),

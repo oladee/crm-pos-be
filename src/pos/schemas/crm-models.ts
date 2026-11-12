@@ -51,6 +51,7 @@ export const ProductSchema = new Schema(
     unit_of_measure: String,
     current_stock: Number,
     base_selling_price: Number,
+    image_url: String,
     carton_price: Number,
     carton_weight: Number,
     avg_unit_cost: Number,
