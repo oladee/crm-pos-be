@@ -359,6 +359,32 @@ describe('customer checkout and payment recovery', () => {
     assert.ok(!JSON.stringify(audit).includes('sandbox_test'));
   });
 
+  it('persists one live till notice with a provider settlement and one scoped review notice', async () => {
+    process.env.POS_LIVE_ENABLED = 'true';
+    const notices = db.db.collection('pos_live_notices');
+    const outbox = db.db.collection('event_outbox');
+    try {
+      const row = await attempt(await create('live-origin'));
+      await webhook(row.attempts[0]);
+      await webhook(row.attempts[0]);
+      await service.tick();
+      const [paid] = await notices.find().toArray();
+      assert.equal(await notices.countDocuments(), 1);
+      assert.deepEqual(paid.audience, { kind: 'till', hubId: String(hub), tillId: 'till-1' });
+      assert.equal(paid.reference, row.clientSaleId);
+      const next = await attempt(await create('live-review'));
+      await webhook(next.attempts[0], { amount: 1 });
+      await service.tick();
+      const review = await notices.findOne({ kind: 'payment-review' });
+      assert.deepEqual(review.audience, { kind: 'location-role', hubId: String(hub), role: 'pos-admin' });
+      assert.equal(await outbox.countDocuments({ type: 'notification.ready.v1' }), 2);
+    } finally {
+      delete process.env.POS_LIVE_ENABLED;
+      await notices.deleteMany({});
+      await outbox.deleteMany({});
+    }
+  });
+
   it('recovers verified webhooks and scheduled checks through BullMQ', {
     skip: !process.env.EVENT_TEST_REDIS_BINARY && 'set EVENT_TEST_REDIS_BINARY for real BullMQ coverage',
     timeout: 60_000,

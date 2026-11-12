@@ -13,6 +13,7 @@ import type { WebhookTrace } from './psp-audit';
 import { eventLog } from '../events/event-jobs';
 import { isEventId } from '../events/event-outbox';
 import { paymentReconciliationQueue } from '../events/payment-reconciliation';
+import { saveLiveNotice } from '../events/live-notices';
 
 const ACTIVE = ['queued', 'pending', 'unknown', 'review'];
 const paymentLease = () => new Date(Date.now() + Math.max(90_000, settingMilliseconds('MONIEPOINT_HTTP_TIMEOUT_MS', 10_000) + 30_000));
@@ -346,10 +347,17 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async storePollReview(attempt: any, hub: Types.ObjectId | undefined, event: TerminalEvidence, reason: string) {
-    await this.model('PosWebhookInbox').updateOne({
+    const result = await this.model('PosWebhookInbox').updateOne({
       provider: attempt.provider, account_key: attempt.account_key,
       event_id: `poll:${attempt.merchant_reference}:${event.transactionReference || 'review'}`,
     }, { $setOnInsert: { evidence: event, hub, state: 'review', review_reason: reason } }, { upsert: true });
+    if (result.upsertedId && hub) await this.notifyReview(result.upsertedId, hub);
+  }
+
+  private notifyReview(id: unknown, hub: Types.ObjectId) {
+    return saveLiveNotice(this.db, { sourceKey: `payment-review:${id}`,
+      audience: { kind: 'location-role', hubId: String(hub), role: 'pos-admin' },
+      kind: 'payment-review', title: 'Payment needs review' });
   }
 
   private async apply(attempt: any, event: TerminalEvidence, pollOwner?: string): Promise<string | null> {
@@ -479,6 +487,10 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     };
     row.status = 'completed'; row.settled_attempt = attempt ? String(attempt._id) : undefined; row.confirmed_at = now; row.confirmation_source = source;
     await row.save();
+    if (row.due_kobo > 0 && (source === 'provider' || source === 'manual')) await saveLiveNotice(this.db, {
+      sourceKey: `payment-confirmed:${row._id}`, audience: { kind: 'till', hubId: String(row.hub), tillId: row.device_id },
+      kind: 'payment-confirmed', title: 'Payment confirmed', reference: row.client_sale_id,
+    });
   }
 
   async cancel(user: PosJwtPayload, id: string) {
@@ -523,8 +535,11 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
       if (attempt && attempt.payable_kobo == null && attempt.status === 'pending') throw new Error('Await provider instructions');
       const reason = attempt ? await this.apply(attempt, event.evidence) : 'No matching payment reference';
       const state = reason ? 'review' : 'done';
-      await this.model('PosWebhookInbox').updateOne({ _id: event._id, lease_owner: owner },
-        { $set: { state, review_reason: reason || undefined }, $unset: { lease_owner: '', lease_until: '' } });
+      await this.atomic(async () => {
+        const result = await this.model('PosWebhookInbox').updateOne({ _id: event._id, ...activeLease(owner) },
+          { $set: { state, review_reason: reason || undefined }, $unset: { lease_owner: '', lease_until: '' } });
+        if (result.matchedCount && reason && event.hub) await this.notifyReview(event._id, event.hub);
+      });
       return state;
     } catch {
       await this.model('PosWebhookInbox').updateOne({ _id: event._id, lease_owner: owner },

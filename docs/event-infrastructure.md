@@ -82,3 +82,44 @@ The API defaults to `POS_PAYMENT_RECONCILIATION_MODE=legacy`. To cut over:
 
 Existing checkout settlement, provider credentials, legacy Squad transfers,
 and explicit manual payment confirmation continue through their existing handlers.
+
+## Live tills and notifications
+
+After deploying the CRM ticket route and the POS gateway, enable
+`POS_LIVE_ENABLED=true` on POS API and payment worker processes. Configure
+`POS_LIVE_CRM_ORIGINS` and `POS_FE_ORIGIN` with exact browser origins. Point the
+CRM API's `POS_LIVE_URL` at `wss://<pos-api>/pos/live` and enable
+`NEXT_PUBLIC_POS_LIVE_ENABLED=true` for the till frontend build.
+Run the event relay and worker so notifications publish across API replicas.
+All participating processes must use the same CRM/POS MongoDB and event Redis
+for their environment.
+
+The CRM endpoint creates a 30-second one-use socket ticket after checking the
+session. It grants dashboard access only to users with `view_pos` and the
+locations they can read, including permitted child RSPs. Till authentication
+uses the current PIN session and active assignment. Credentials travel in the
+first WebSocket frame, outside URLs. The gateway refreshes authentication after
+five minutes. Heartbeats run every 15 seconds and dashboard presence expires
+after 45 seconds. The CRM refreshes the authoritative snapshot every 30 seconds,
+including shift or payment changes made while a till is offline. Only coarse
+activity transitions are retained.
+
+Notices are saved together with an outbox record in the source transaction.
+The Redis broadcast contains the notice ID and MongoDB holds the audience and
+display fields. Reconnecting clients fetch their most recent 50 eligible
+notices. The three recipient types are:
+
+- `till` uses the originating checkout's `hubId` and `tillId`.
+- `location-role` uses the review's `hubId` and the `pos-admin` role.
+- `user` uses the authenticated account's exact MongoDB ID. Import or export
+  completion producers can persist `kind: personal` with their saved
+  requester ID and an operation-specific source key.
+
+Keep source keys stable for retries. Store a notice in `pos_live_notices` and
+its `notification.ready.v1` outbox event with `noticeId` in the same source
+transaction. Payment confirmation tones require an explicit browser gesture.
+The till uses a shared IndexedDB claim to play each live notice once across
+tabs. Recovered notices appear in the notification list silently.
+The till restores its existing receipt polling notices when the Redis
+subscription drops or heartbeat acknowledgements stop. Visual notices remain
+available when the browser denies access to notification storage.

@@ -2,6 +2,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Queue, Worker } from 'bullmq';
 import Redis from 'ioredis';
 import { createConnection } from 'mongoose';
+import { liveChannel } from './live-notices';
 import {
   eventLog,
   cleanupFailedEventJob,
@@ -118,7 +119,7 @@ async function main() {
       } else {
         const worker = new Worker<EventJob>(
           eventQueue,
-          (job) => processEvent(outbox, job),
+          (job) => processEvent(outbox, job, id => redis.publish(liveChannel, JSON.stringify({ noticeId: id }))),
           {
             connection: redis,
             concurrency: 4,

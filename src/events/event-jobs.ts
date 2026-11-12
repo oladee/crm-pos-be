@@ -5,6 +5,7 @@ import {
   isEventId,
   type EventOutbox,
 } from './event-outbox';
+import { liveNoticeEvent } from './live-notices';
 
 export type EventJob = { eventId: string; generation: number };
 type Trace = {
@@ -53,7 +54,7 @@ export async function dispatchEvent(
   if (!event) return false;
 
   const { eventId, correlationId, generation, type } = event;
-  const hubId = event.hubId.toString();
+  const hubId = event.hubId?.toString();
   const jobId = `${eventId}-${generation}`;
   const trace = { eventId, correlationId, generation, hubId, jobId, type };
   try {
@@ -62,7 +63,7 @@ export async function dispatchEvent(
     const state = await job?.getState();
     if (state === 'failed') {
       const result = await outbox.updateOne(
-        { eventId, hubId, generation, status: 'pending' },
+        { eventId, generation, status: 'pending' },
         {
           $set: { status: 'failed', failedAt: new Date(), nextCleanupAt: now },
           $addToSet: { cleanupGenerations: generation },
@@ -122,7 +123,7 @@ export async function cleanupFailedEventJob(
   const jobId = `${event.eventId}-${generation}`;
   const trace = {
     eventId: event.eventId,
-    hubId: event.hubId.toString(),
+    hubId: event.hubId?.toString(),
     correlationId: event.correlationId,
     generation,
     jobId,
@@ -150,14 +151,14 @@ export async function cleanupFailedEventJob(
   return true;
 }
 
-export async function processEvent(outbox: EventOutbox, job: Job<EventJob>) {
+export async function processEvent(outbox: EventOutbox, job: Job<EventJob>, publishNotice?: (id: string) => Promise<unknown>) {
   const { eventId, generation } = job.data ?? {};
   if (
     !isEventId(eventId) ||
     !Number.isSafeInteger(generation) ||
     generation < 0 ||
     job.id !== `${eventId}-${generation}` ||
-    job.name !== diagnosticEvent
+    (job.name !== diagnosticEvent && job.name !== liveNoticeEvent)
   ) {
     throw new UnrecoverableError('invalid_event_job');
   }
@@ -178,14 +179,19 @@ export async function processEvent(outbox: EventOutbox, job: Job<EventJob>) {
       eventLog('debug', 'event_duplicate_or_stale', trace);
       return;
     }
-    trace.hubId = event.hubId.toString();
+    trace.hubId = event.hubId?.toString();
     trace.correlationId = event.correlationId;
     eventLog('debug', 'event_processing', trace);
     failureCode = 'event_commit_error';
+    if (event.type === liveNoticeEvent) {
+      failureCode = 'notice_publish_error';
+      if (!event.noticeId || !publishNotice) throw new Error(failureCode);
+      await publishNotice(event.noticeId.toString());
+    }
     // The diagnostic has no external side effect. Its conditional completion
     // is the result, so a repeat delivery cannot apply the result twice.
     const result = await outbox.updateOne(
-      { eventId, hubId: event.hubId, generation, status: 'pending' },
+      { eventId, generation, status: 'pending' },
       {
         $set: { status: 'completed', completedAt: new Date() },
         $unset: { nextDispatchAt: 1 },

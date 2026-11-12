@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Schema, Types, type ClientSession, type Connection } from 'mongoose';
+import { liveNoticeEvent } from './live-notices';
 
 export const eventQueue = 'platform-events-v1';
 export const diagnosticEvent = 'diagnostic.requested.v1';
@@ -7,9 +8,10 @@ export const diagnosticEvent = 'diagnostic.requested.v1';
 const outboxSchema = new Schema(
   {
     eventId: { type: String, required: true, unique: true },
-    hubId: { type: Schema.Types.ObjectId, required: true },
+    hubId: Schema.Types.ObjectId,
+    noticeId: Schema.Types.ObjectId,
     correlationId: { type: String, required: true },
-    type: { type: String, required: true, enum: [diagnosticEvent] },
+    type: { type: String, required: true, enum: [diagnosticEvent, liveNoticeEvent] },
     occurredAt: { type: Date, required: true },
     status: {
       type: String,
