@@ -271,6 +271,28 @@ describe('customer checkout and payment recovery', () => {
     const history = await api('/transactions/refund-credit');
     assert.equal(history.data.receipt.returnedQty[String(product)], 1);
   });
+  it('publishes committed POS sales and one location change for a retried refund', async () => {
+    const events = db.db.collection('engagement_sale_events');
+    process.env.ENGAGEMENT_EVENTS_ENABLED = 'true';
+    try {
+      const row = await attempt(await create('engagement-sale'));
+      await webhook(row.attempts[0]);
+      await service.tick();
+      const body = { reversalId: 'engagement-refund', total: -10000,
+        lines: [{ productId: String(product), qty: 1, unitPrice: 10000, saleUnit: 'Units' }],
+        payments: [{ method: 'Transfer', amount: -10000 }] };
+      assert.equal((await api('/sales/engagement-sale/refund', body)).status, 201);
+      assert.equal((await api('/sales/engagement-sale/refund', body)).status, 201);
+      const rows = await events.find().sort({ _id: 1 }).toArray();
+      assert.equal(rows.length, 2);
+      assert.equal(String(rows[0].after.customerId), String(customer));
+      assert.equal(rows[1].after.customerId, null);
+      assert.equal(String(rows[1].after.hubId), String(hub));
+    } finally {
+      delete process.env.ENGAGEMENT_EVENTS_ENABLED;
+      await events.deleteMany({});
+    }
+  });
   it('finishes an existing Bachs transfer without allowing a new Bachs request', async () => {
     const pos = app.get(require('../dist/pos/pos.service').PosService);
     let reservation;

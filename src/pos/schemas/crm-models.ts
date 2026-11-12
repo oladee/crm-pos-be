@@ -1,5 +1,6 @@
 import { productInventoryGuard, stockLogInventoryGuard } from '../inventory-guard';
 import { Schema } from 'mongoose';
+import { registerEngagementSaleEvents } from '../../events/engagement-sale-events';
 
 export const UserSchema = new Schema(
   {
@@ -111,6 +112,7 @@ export const SaleSchema = new Schema(
 
 SaleSchema.index({ hub: 1, reversal_of: 1 });
 SaleSchema.index({ hub: 1, date: -1 });
+registerEngagementSaleEvents(SaleSchema);
 
 export const CustomerSchema = new Schema(
   {
