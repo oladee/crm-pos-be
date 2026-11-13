@@ -182,7 +182,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
   async attempt(user: PosJwtPayload, id: string, input: any) {
     const checkout = await this.row(user, id);
     const provider = input.provider, method = input.method;
-    if (!['moniepoint', 'squad'].includes(provider) || !['card', 'transfer'].includes(method) || (provider === 'squad' && method !== 'transfer')) throw new BadRequestException('Choose a supported payment provider and method');
+    if (!['moniepoint', 'squad'].includes(provider) || !['card', 'transfer', 'any'].includes(method) || (provider === 'squad' && method !== 'transfer')) throw new BadRequestException('Choose a supported payment provider and method');
     const clientId = String(input.clientAttemptId || '').trim();
     if (!clientId || clientId.length > 150) throw new BadRequestException('clientAttemptId is required');
     const findPrevious = async () => {
@@ -249,7 +249,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     if (!claimed) return 'stale';
     try {
       if (claimed.provider === 'moniepoint') {
-        const providerReference = await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl, this.auditHttp(await this.auditedAttempt(claimed, correlationId))).open(claimed.merchant_reference, claimed.terminal_serial, claimed.amount_kobo, claimed.method);
+        const providerReference = await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl, this.auditHttp(await this.auditedAttempt(claimed, correlationId))).open(claimed.merchant_reference, claimed.terminal_serial, claimed.amount_kobo);
         if (providerReference) await this.model('PosPaymentAttempt').updateOne(
           { _id: claimed._id, provider_reference: { $exists: false } },
           { $set: { provider_reference: providerReference } },

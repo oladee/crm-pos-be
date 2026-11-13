@@ -86,9 +86,9 @@ export class MoniepointClient {
     return data;
   }
 
-  async open(reference: string, terminalSerial: string, amountKobo: number, method: 'card' | 'transfer') {
+  async open(reference: string, terminalSerial: string, amountKobo: number) {
     const row = await this.request('/v1/transactions', { terminalSerial, amount: amountKobo, merchantReference: reference,
-      transactionType: 'PURCHASE', paymentMethod: method === 'card' ? 'CARD_PURCHASE' : 'POS_TRANSFER' });
+      transactionType: 'PURCHASE', paymentMethod: 'ANY' });
     return row?.merchantReference === reference ? providerReference(row.transactionReference) : undefined;
   }
 

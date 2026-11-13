@@ -35,7 +35,7 @@ describe('customer checkout and payment recovery', () => {
     const reference = attemptRow.reference;
     const received = requests.get(reference);
     if (received) received.paid = true;
-    const body = { eventId: `body-${reference}`, eventType: received?.paymentMethod === 'CARD_PURCHASE' ? 'V1_POS_PURCHASE_TRANSACTION' : 'V1_POS_TRANSFER_TRANSACTION',
+    const body = { eventId: `body-${reference}`, eventType: received?.actualPaymentMethod === 'CARD_PURCHASE' ? 'V1_POS_PURCHASE_TRANSACTION' : 'V1_POS_TRANSFER_TRANSACTION',
       data: { businessId: 100, businessOwnerId: 101, terminalSerial: 'SERIAL-1', amount: attemptRow.payableKobo,
         merchantReference: reference, transactionReference: `txn-${reference}`, transactionType: 'POS_TRANSFER',
         transactionStatus: 'COMPLETED', responseCode: '20000', ...overrides } };
@@ -68,7 +68,7 @@ describe('customer checkout and payment recovery', () => {
       const json = (body, status = 200) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
       if (path === '/v1/transactions' && req.method === 'POST') {
         assert.equal(req.headers.authorization, 'Bearer test-key');
-        const body = JSON.parse(raw); pushCalls++; requests.set(body.merchantReference, { ...body, paid: false });
+        const body = JSON.parse(raw); assert.equal(body.paymentMethod, 'ANY'); pushCalls++; requests.set(body.merchantReference, { ...body, paid: false });
         if (nextBehavior === 'early-webhook') {
           nextBehavior = 'normal';
           await webhook({ reference: body.merchantReference, payableKobo: body.amount }); await service.tick();
@@ -84,7 +84,7 @@ describe('customer checkout and payment recovery', () => {
         if (!row) return json({}, 404);
         return json({ merchantReference: ref, businessOwnerId: 101, terminalSerial: row.terminalSerial,
           processingStatus: row.paid ? 'PROCESSED' : 'PENDING', responseCode: row.paid ? '20000' : null,
-          actualAmount: row.paid ? row.amount : null, transactionReference: `txn-${ref}`, actualPaymentMethod: row.paymentMethod });
+          actualAmount: row.paid ? row.amount : null, transactionReference: `txn-${ref}`, actualPaymentMethod: row.actualPaymentMethod || 'POS_TRANSFER' });
       }
       if (path === '/virtual-account/initiate-dynamic-virtual-account') {
         const body = JSON.parse(raw); squadPushCalls++; requests.set(body.transaction_ref, { amount: body.amount, paid: false });
@@ -263,7 +263,8 @@ describe('customer checkout and payment recovery', () => {
     assert.equal((await api(`/checkouts/${row.id}`)).data.status, 'completed'); assert.equal(await db.model('Sale').countDocuments(), 1);
     assert.equal(await db.model('PosTerminalLock').countDocuments(), 0);
     assert.equal(await db.model('PosProviderTransaction').countDocuments(), 1);
-    const card = await attempt(await create('terminal-card'), 'card-attempt', 'moniepoint', { method: 'card' });
+    const card = await attempt(await create('terminal-card'), 'card-attempt', 'moniepoint', { method: 'any' });
+    requests.get(card.attempts[0].reference).actualPaymentMethod = 'CARD_PURCHASE';
     await webhook(card.attempts[0]); await service.tick();
     const completed = (await api(`/checkouts/${card.id}`)).data;
     assert.equal(completed.status, 'completed');
