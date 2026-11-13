@@ -197,6 +197,17 @@ describe('customer checkout and payment recovery', () => {
     assert.equal(filtered.data.data.length, 26);
     assert.equal((await api('/transactions?before=invalid')).status, 400);
     assert.equal((await api('/transactions?q=.*')).data.data.length, 0);
+    await db.model('PosCheckout').updateOne({ client_sale_id: 'page-52' }, { status: 'review' });
+    await db.model('PosCheckout').updateOne({ client_sale_id: 'page-51' }, { status: 'cancelled' });
+    const pendingPage = await api('/transactions?status=pending');
+    assert.equal(pendingPage.data.data.length, 50);
+    assert.ok(pendingPage.data.nextCursor);
+    const pendingRest = await api('/transactions?status=pending&before=' + pendingPage.data.nextCursor);
+    const pendingRows = [...pendingPage.data.data, ...pendingRest.data.data];
+    assert.equal(pendingRows.length, 52);
+    assert.equal(pendingRows.filter(row => row.status === 'review').length, 1);
+    const resolved = await api('/transactions?status=resolved');
+    assert.deepEqual(resolved.data.data.map(row => row.status), ['cancelled']);
     const pending = await api('/transactions/page-0'); assert.equal(pending.data.receipt, null);
   });
   it('records full and partial credit without treating debt as money received', async () => {

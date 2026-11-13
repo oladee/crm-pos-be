@@ -191,7 +191,11 @@ export class TransactionsService {
       const regex = new RegExp(escape(query.q), 'i');
       filter.$or = [{ reference: regex }, { customer: regex }];
     }
-    if (query.status) {
+    if (query.status === 'pending') {
+      filter.status = { $in: ['awaiting', 'review'] };
+    } else if (query.status === 'resolved') {
+      filter.status = { $in: ['completed', 'cancelled', 'voided', 'refunded'] };
+    } else if (query.status) {
       if (
         ![
           'completed',
