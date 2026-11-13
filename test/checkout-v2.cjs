@@ -254,7 +254,7 @@ describe('customer checkout and payment recovery', () => {
     const current = await db.model('CreditRecord').findById(credit._id); assert.equal(current.amount_owed, 150); assert.equal(current.payments.length, 1);
     assert.equal((await api('/credit-collections', { ...input, clientSaleId: 'too-much', amountKobo: 15001 })).status, 400);
   });
-  it('matches signed Moniepoint card and transfer events by reference, deduplicates and releases terminal locks', async () => {
+  it('matches signed Moniepoint card and transfer events by reference, and deduplicates them', async () => {
     const row = await attempt(await create('terminal'));
     assert.equal(pushCalls, 1);
     await attempt(row); assert.equal(pushCalls, 1);
@@ -279,13 +279,15 @@ describe('customer checkout and payment recovery', () => {
     await restarted.poll(await db.model('PosPaymentAttempt').findById(second.attempts[0].id));
     assert.equal((await api(`/checkouts/${second.id}`)).data.status, 'completed');
   });
-  it('serializes duplicate provider clicks and refuses terminal contention across orders', async () => {
+  it('deduplicates provider clicks and permits new pushes across orders', async () => {
     const first = await create('first');
     const results = await Promise.all([attempt(first), attempt(first)]);
     assert.equal(results[0].attempts.length, 1); assert.equal(pushCalls, 1);
     const second = await create('second');
-    const blocked = await api(`/checkouts/${second.id}/payment-attempts`, { clientAttemptId: 'different', provider: 'moniepoint', method: 'card' });
-    assert.equal(blocked.status, 409); assert.equal(pushCalls, 1);
+    const next = await attempt(second, 'different', 'moniepoint', { method: 'card' });
+    assert.equal(pushCalls, 2);
+    assert.notEqual(next.attempts[0].reference, results[0].attempts[0].reference);
+    assert.equal((await api(`/checkouts/${first.id}`)).data.attempts[0].status, 'pending');
     process.env.MONIEPOINT_ENABLED = 'false';
     await webhook(results[0].attempts[0]); await service.tick();
     assert.equal((await api(`/checkouts/${first.id}`)).data.status, 'completed');
@@ -361,12 +363,12 @@ describe('customer checkout and payment recovery', () => {
     assert.equal(await db.model('Sale').countDocuments(), 1);
     assert.ok(results.some(result => result.status === 'fulfilled'));
   });
-  it('keeps timeout requests locked, permits manual fallback, and reviews later additional money', async () => {
+  it('permits a new push after a timeout and reviews late money after manual fallback', async () => {
     nextBehavior = 'timeout'; process.env.MONIEPOINT_HTTP_TIMEOUT_MS = '100';
     const row = await attempt(await create('timeout')); assert.equal(row.attempts[0].status, 'unknown');
     assert.equal((await api(`/checkouts/${row.id}/cancel`, {})).status, 409);
     assert.equal((await manual(row)).status, 201);
-    assert.equal(await db.model('PosTerminalLock').countDocuments(), 1);
+    assert.equal(await db.model('PosTerminalLock').countDocuments(), 0);
     await webhook(row.attempts[0]); await service.tick();
     assert.equal(await db.model('Sale').countDocuments(), 1);
     const reviews = await api('/checkouts/reviews', undefined, managerToken); assert.match(reviews.data.data[0].reason, /Additional payment/);
@@ -440,7 +442,7 @@ describe('customer checkout and payment recovery', () => {
     }
   });
 
-  it('suppresses an unsent queued request after manual completion and holds its lock until then', async () => {
+  it('suppresses an unsent queued request after manual completion and accepts another checkout', async () => {
     process.env.POS_PAYMENT_RECONCILIATION_MODE = 'bullmq';
     process.env.POS_PAYMENT_DISPATCH_MODE = 'bullmq';
     try {
@@ -452,8 +454,8 @@ describe('customer checkout and payment recovery', () => {
       assert.equal(pushCalls, 0);
       assert.equal(await db.model('PosPaymentAttempt').countDocuments(), 1);
       const other = await create('queued-terminal-contention');
-      const denied = await api(`/checkouts/${other.id}/payment-attempts`, { provider: 'moniepoint', method: 'card', clientAttemptId: 'other' });
-      assert.equal(denied.status, 409);
+      const otherQueued = (await attempt(other, 'other', 'moniepoint', { method: 'card' })).attempts[0];
+      assert.equal(otherQueued.status, 'queued');
       assert.equal((await api(`/checkouts/${row.id}?refresh=1`)).data.attempts[0].status, 'queued');
       assert.equal((await manual(row, { attemptId: queued.id })).status, 400);
       assert.equal((await manual(row)).status, 201);
@@ -463,7 +465,7 @@ describe('customer checkout and payment recovery', () => {
       assert.equal(await service.poll({ ...stale, status: 'queued' }, queued.id), 'stale');
       assert.equal(pushCalls, 0);
       assert.equal(await db.model('Sale').countDocuments(), 1);
-      const disabled = (await attempt(other)).attempts[0];
+      const disabled = otherQueued;
       process.env.MONIEPOINT_ENABLED = 'false';
       await service.poll(await db.model('PosPaymentAttempt').findById(disabled.id), disabled.id);
       assert.equal((await db.model('PosPaymentAttempt').findById(disabled.id)).status, 'failed');
@@ -487,7 +489,7 @@ describe('customer checkout and payment recovery', () => {
       const locks = db.model('PosTerminalLock');
       const run = async (id, mutation, restore, expected) => {
         const queued = (await attempt(row, id)).attempts.at(-1);
-        assert.equal(await locks.countDocuments(), 1);
+        assert.equal(await locks.countDocuments(), 0);
         await mutation();
         await service.poll(await attempts.findById(queued.id), queued.id);
         await restore();
@@ -541,7 +543,7 @@ describe('customer checkout and payment recovery', () => {
       } else {
         assert.equal(cancelResult.status, 409);
         assert.equal(pushCalls, 1);
-        assert.equal(await locks.countDocuments(), 1);
+        assert.equal(await locks.countDocuments(), 0);
       }
     } finally {
       process.env.MONIEPOINT_TERMINALS_JSON = terminals;
@@ -691,7 +693,7 @@ describe('customer checkout and payment recovery', () => {
       await startWorker();
       await waitFor(async () => (await attempts.findById(queued.id)).status === 'unknown');
       assert.equal(pushCalls, priorPushes + 1);
-      assert.equal(await db.model('PosTerminalLock').countDocuments(), 1);
+      assert.equal(await db.model('PosTerminalLock').countDocuments(), 0);
       await attempt(pendingPush);
       assert.equal(pushCalls, priorPushes + 1);
       requests.get(queued.reference).paid = true;
@@ -764,7 +766,7 @@ describe('customer checkout and payment recovery', () => {
           assert.equal(actual.next_check.getTime(), replacement.next_check.getTime());
           assert.equal(actual.status, 'pending');
           assert.equal(actual.failures, 0);
-          assert.equal(await db.model('PosTerminalLock').countDocuments(), 1);
+          assert.equal(await db.model('PosTerminalLock').countDocuments(), 0);
           assert.equal(await db.model('PosWebhookInbox').countDocuments(), 0);
           assert.equal(await db.model('Sale').countDocuments(), 0);
         } finally {
@@ -812,7 +814,7 @@ describe('customer checkout and payment recovery', () => {
       const result = await opening;
       assert.equal(result.attempts[0].status, 'pending');
       assert.equal((await model.findById(pending._id)).next_check.getTime(), scheduled.getTime());
-      assert.equal(await db.model('PosTerminalLock').countDocuments(), 1);
+      assert.equal(await db.model('PosTerminalLock').countDocuments(), 0);
       assert.equal(await db.model('Sale').countDocuments(), 0);
     } finally {
       resume();
@@ -913,7 +915,7 @@ describe('customer checkout and payment recovery', () => {
     try {
       const row = await attempt(await create('audit-result-offline'));
       assert.equal(pushCalls, 1); assert.equal(row.attempts[0].status, 'unknown');
-      assert.equal(await db.model('PosTerminalLock').countDocuments(), 1);
+      assert.equal(await db.model('PosTerminalLock').countDocuments(), 0);
       assert.equal(await db.model('Sale').countDocuments(), 0);
     } finally { audit.append = append; }
   });

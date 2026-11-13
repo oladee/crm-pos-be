@@ -202,16 +202,11 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
       const active = await this.model('PosPaymentAttempt').exists({ checkout: row._id, status: { $in: ACTIVE } });
       if (active && input.acknowledgeDuplicateRisk !== true) throw new ConflictException('An earlier payment may still arrive. Confirm the duplicate-payment warning before switching.');
       const attemptId = new Types.ObjectId();
-      const terminalLock = provider === 'moniepoint' ? `moniepoint:${mapping.terminalSerial}` : undefined;
-      if (terminalLock) {
-        try { await this.model('PosTerminalLock').create([{ _id: terminalLock, attempt: attemptId }]); }
-        catch (error: any) { if (error?.code === 11000) throw new ConflictException('This terminal has an unresolved payment. Check it before sending another request.'); throw error; }
-      }
       await this.model('PosPaymentAttempt').create([{
         _id: attemptId, checkout: row._id, client_attempt_id: clientId, merchant_reference: `MP-${attemptId}`,
         provider, method, account_key: provider === 'moniepoint' ? mapping.accountKey : 'squad',
         account_snapshot: provider === 'moniepoint' ? config.accounts[mapping.accountKey] : undefined,
-        terminal_serial: terminalLock ? mapping.terminalSerial : undefined, terminal_lock: terminalLock,
+        terminal_serial: provider === 'moniepoint' ? mapping.terminalSerial : undefined,
         dispatch_actor: user.sub, dispatch_role: user.role, dispatch_device: user.deviceId,
         amount_kobo: row.due_kobo, payable_kobo: provider === 'moniepoint' ? row.due_kobo : undefined,
         fee_kobo: provider === 'moniepoint' ? 0 : undefined, status: 'queued',
