@@ -340,6 +340,7 @@ export class TransactionsService {
           discount: snap.discount || 0,
           tax: snap.tax,
           taxRatePct: snap.taxRatePct,
+          taxInclusive: snap.taxInclusive,
           payments: [{ method: 'Transfer', amount: row.cart_total_kobo }],
           change: 0,
           lines: snap.lines.map((line: any) => ({

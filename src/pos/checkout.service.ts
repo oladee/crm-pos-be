@@ -157,7 +157,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
       status: row.status, paymentMode: row.mode, totalKobo: row.total_kobo, dueKobo: row.due_kobo, creditKobo: row.credit_kobo,
       dueDate: row.due_date, receipt: row.receipt || null, reviewReason: row.review_reason || null, createdAt: row.createdAt,
       canConfirmReceived: ['awaiting', 'review'].includes(row.status) && row.due_kobo > 0,
-      attempts: attempts.map(a => ({ id: String(a._id), clientAttemptId: a.client_attempt_id, reference: a.merchant_reference, provider: a.provider,
+      attempts: attempts.map(a => ({ id: String(a._id), clientAttemptId: a.client_attempt_id, reference: a.merchant_reference, providerReference: a.provider_reference, providerPaidAt: a.provider_paid_at, provider: a.provider,
         method: a.method, status: a.status, amountKobo: a.amount_kobo, payableKobo: a.payable_kobo ?? null,
         feeKobo: a.fee_kobo ?? null, instructions: a.instructions || null, reviewReason: a.review_reason || null })) };
   }
@@ -254,7 +254,11 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
     if (!claimed) return 'stale';
     try {
       if (claimed.provider === 'moniepoint') {
-        await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl, this.auditHttp(await this.auditedAttempt(claimed, correlationId))).open(claimed.merchant_reference, claimed.terminal_serial, claimed.amount_kobo, claimed.method);
+        const providerReference = await new MoniepointClient(claimed.account_snapshot, checkoutConfiguration().baseUrl, this.auditHttp(await this.auditedAttempt(claimed, correlationId))).open(claimed.merchant_reference, claimed.terminal_serial, claimed.amount_kobo, claimed.method);
+        if (providerReference) await this.model('PosPaymentAttempt').updateOne(
+          { _id: claimed._id, provider_reference: { $exists: false } },
+          { $set: { provider_reference: providerReference } },
+        );
       } else {
         const row = await this.model('PosCheckout').findById(claimed.checkout);
         const staff = await this.model('User').findById(row.cashier).lean();
@@ -423,6 +427,12 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
       if (event.reference !== current.merchant_reference || (current.provider === 'moniepoint' &&
         (event.terminalSerial !== current.terminal_serial || event.businessOwnerId !== current.account_snapshot.businessOwnerId ||
         (event.businessId != null && event.businessId !== current.account_snapshot.businessId)))) return 'Payment reference, business or terminal does not match';
+      if (current.provider === 'moniepoint' && event.transactionReference && !current.provider_reference) {
+        await this.model('PosPaymentAttempt').updateOne(
+          { _id: current._id, provider_reference: { $exists: false } },
+          { $set: { provider_reference: event.transactionReference } },
+        );
+      }
       if (event.status === 'pending') return null;
       const updateNonSettlement = (changes: Record<string, unknown>) => this.model('PosPaymentAttempt').updateOne(
         { _id: current._id, ...(pollOwner ? activeLease(pollOwner) : {}) }, { $set: changes });
@@ -441,6 +451,12 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
         if (pollOwner) await this.storePollReview(current, row.hub, event, reason);
         return reason;
       };
+      if (current.provider === 'moniepoint' && event.paidAt) {
+        await this.model('PosPaymentAttempt').updateOne(
+          { _id: current._id, provider_paid_at: { $exists: false } },
+          { $set: { provider_paid_at: event.paidAt } },
+        );
+      }
       const unique = { provider: current.provider, account_key: current.account_key, transaction_reference: event.transactionReference };
       const previous = await this.model('PosProviderTransaction').findOne(unique);
       if (previous && String(previous.checkout) !== String(row._id)) return paidReview('Payment was already allocated to another checkout');
@@ -535,7 +551,7 @@ export class CheckoutService implements OnModuleInit, OnModuleDestroy {
         lineTotal: Math.round(line.unitPriceKobo * line.quantity) - line.discountKobo, batchNumber: line.batchNumber,
         saleWeightKg: line.saleWeightKg })) : [],
       subtotal: snap?.subtotal ?? row.total_kobo, discount: snap?.discount || 0, tax: snap?.tax || 0,
-      taxRatePct: snap?.taxRatePct, total: row.total_kobo, payments, change: 0, status: 'completed', createdAt: row.createdAt || now, syncState: 'synced',
+      taxRatePct: snap?.taxRatePct, taxInclusive: snap?.taxInclusive, total: row.total_kobo, payments, change: 0, status: 'completed', createdAt: row.createdAt || now, syncState: 'synced',
       receiptPayment: { provider: attempt?.provider || (source === 'credit' ? 'credit' : 'manual'), checkoutReference: attempt?.merchant_reference || row.manual?.externalReference,
         feeKobo: attempt?.fee_kobo ?? 0, paidKobo: row.due_kobo + (attempt?.fee_kobo || 0), confirmedAt: now.toISOString(), confirmationSource: source,
         actualMethod: method, account: row.manual?.account },

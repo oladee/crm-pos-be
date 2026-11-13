@@ -84,7 +84,7 @@ describe('customer checkout and payment recovery', () => {
         if (!row) return json({}, 404);
         return json({ merchantReference: ref, businessOwnerId: 101, terminalSerial: row.terminalSerial,
           processingStatus: row.paid ? 'PROCESSED' : 'PENDING', responseCode: row.paid ? '20000' : null,
-          actualAmount: row.paid ? row.amount : null, transactionReference: row.paid ? `txn-${ref}` : '', actualPaymentMethod: row.paymentMethod });
+          actualAmount: row.paid ? row.amount : null, transactionReference: `txn-${ref}`, actualPaymentMethod: row.paymentMethod });
       }
       if (path === '/virtual-account/initiate-dynamic-virtual-account') {
         const body = JSON.parse(raw); squadPushCalls++; requests.set(body.transaction_ref, { amount: body.amount, paid: false });
@@ -132,6 +132,24 @@ describe('customer checkout and payment recovery', () => {
     assert.equal((await api('/checkouts', draft('foreign', { customerId: String(foreign._id) }))).status, 400);
     assert.equal(await db.model('Sale').countDocuments(), 0);
   });
+  it('traces a pending Moniepoint request and corroborates a late manual payment once', async () => {
+    const row = await attempt(await create('late-payment'));
+    const original = row.attempts[0];
+    const checked = await api('/checkouts/' + row.id + '?refresh=1');
+    assert.equal(checked.data.attempts[0].providerReference, 'txn-' + original.reference);
+    assert.equal(checked.data.attempts[0].providerPaidAt, undefined);
+    assert.equal(pushCalls, 1);
+    const confirmed = await manual(row, { attemptId: original.id, externalReference: 'txn-' + original.reference });
+    assert.equal(confirmed.status, 201);
+    assert.equal((await webhook(original, { paidAt: '2026-11-13T14:00:00Z' })).status, 201);
+    await service.tick();
+    const final = await api('/checkouts/' + row.id);
+    assert.equal(final.data.status, 'completed');
+    assert.equal(final.data.attempts[0].providerPaidAt, '2026-11-13T14:00:00.000Z');
+    assert.equal(await db.model('Sale').countDocuments(), 1);
+    assert.equal((await db.model('Product').findById(product)).current_stock, 8);
+  });
+
   it('manual completion is atomic and idempotent and uses the database customer name', async () => {
     const row = await create('manual', { customerName: 'Forged' }); assert.equal(row.customerName, 'Buyer');
     const results = await Promise.all([manual(row), manual(row)]); assert.ok(results.every(r => r.status === 201));

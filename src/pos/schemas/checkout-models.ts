@@ -25,6 +25,8 @@ export const PosPaymentAttemptSchema = new Schema({
   dispatch_actor: Schema.Types.ObjectId, dispatch_role: String, dispatch_device: String,
   status: { type: String, enum: ['queued', 'pending', 'unknown', 'paid', 'failed', 'review'], default: 'queued' },
   amount_kobo: Number, payable_kobo: Number, fee_kobo: Number, instructions: Schema.Types.Mixed,
+  provider_reference: String,
+  provider_paid_at: Date,
   review_reason: String, failures: { type: Number, default: 0 }, next_check: Date,
   lease_owner: String, lease_until: Date,
 }, { collection: 'pos_payment_attempts', timestamps: true });

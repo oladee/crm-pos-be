@@ -7,7 +7,7 @@ export type TerminalEvidence = {
   reference: string; transactionReference?: string; eventId: string;
   status: 'paid' | 'failed' | 'pending' | 'review'; amountKobo?: number;
   businessId?: string; businessOwnerId?: string; terminalSerial?: string;
-  method?: 'Card' | 'Transfer'; currency?: string;
+  method?: 'Card' | 'Transfer'; currency?: string; paidAt?: string;
 };
 
 function outcome(row: any, polling: boolean): TerminalEvidence['status'] {
@@ -16,6 +16,17 @@ function outcome(row: any, polling: boolean): TerminalEvidence['status'] {
   if ((polling ? state === 'PROCESSED' : ['COMPLETED', 'APPROVED'].includes(state)) && ['00', '20000'].includes(code)) return 'paid';
   if (['CANCELLED', 'FAILED', 'DECLINED'].includes(state)) return 'failed';
   return ['PENDING', 'PROCESSING', ''].includes(state) ? 'pending' : 'review';
+}
+
+function providerReference(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function verifiedPaidAt(row: any, polling: boolean) {
+  const value = row.paidAt;
+  return outcome(row, polling) === 'paid' && typeof value === 'string' &&
+    /(?:Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value))
+    ? new Date(value).toISOString() : undefined;
 }
 
 export class MoniepointClient {
@@ -76,17 +87,18 @@ export class MoniepointClient {
   }
 
   async open(reference: string, terminalSerial: string, amountKobo: number, method: 'card' | 'transfer') {
-    await this.request('/v1/transactions', { terminalSerial, amount: amountKobo, merchantReference: reference,
+    const row = await this.request('/v1/transactions', { terminalSerial, amount: amountKobo, merchantReference: reference,
       transactionType: 'PURCHASE', paymentMethod: method === 'card' ? 'CARD_PURCHASE' : 'POS_TRANSFER' });
+    return row?.merchantReference === reference ? providerReference(row.transactionReference) : undefined;
   }
 
   async check(reference: string): Promise<TerminalEvidence> {
     const row = await this.request(`/v1/transactions/merchants/${encodeURIComponent(reference)}`);
     if (!row || row.merchantReference !== reference) throw new ProviderFailure('Moniepoint returned an unrelated payment.', false);
-    return { reference, eventId: `poll:${reference}`, status: outcome(row, true), transactionReference: row.transactionReference || undefined,
+    return { reference, eventId: `poll:${reference}`, status: outcome(row, true), transactionReference: providerReference(row.transactionReference),
       amountKobo: row.actualAmount, businessOwnerId: String(row.businessOwnerId ?? ''), terminalSerial: row.terminalSerial,
       method: row.actualPaymentMethod === 'CARD_PURCHASE' ? 'Card' : row.actualPaymentMethod === 'POS_TRANSFER' ? 'Transfer' : undefined,
-      currency: row.currency || 'NGN' };
+      currency: row.currency || 'NGN', paidAt: verifiedPaidAt(row, true) };
   }
 
   webhook(raw: string, headers: Record<string, any>): TerminalEvidence | null {
@@ -99,9 +111,9 @@ export class MoniepointClient {
     const body = JSON.parse(raw), row = body.data;
     if (!['V1_POS_PURCHASE_TRANSACTION', 'V1_POS_TRANSFER_TRANSACTION'].includes(body.eventType)) return null;
     if (!row || String(row.businessId) !== this.account.businessId || String(row.businessOwnerId) !== this.account.businessOwnerId) throw new Error('Unexpected business');
-    return { reference: String(row.merchantReference || ''), transactionReference: row.transactionReference || undefined, eventId: id,
+    return { reference: String(row.merchantReference || ''), transactionReference: providerReference(row.transactionReference), eventId: id,
       status: outcome(row, false), amountKobo: row.amount, businessId: String(row.businessId), businessOwnerId: String(row.businessOwnerId),
-      terminalSerial: row.terminalSerial, currency: row.currency || 'NGN',
+      terminalSerial: row.terminalSerial, currency: row.currency || 'NGN', paidAt: verifiedPaidAt(row, false),
       method: body.eventType === 'V1_POS_PURCHASE_TRANSACTION' ? 'Card' : 'Transfer' };
   }
 }
